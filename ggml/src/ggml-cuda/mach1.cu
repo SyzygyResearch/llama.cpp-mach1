@@ -11524,6 +11524,7 @@ static bool mach1_gg_i8_ok() {
             CUDA_CHECK(cudaMemcpy(&c00, c, sizeof(int32_t), cudaMemcpyDeviceToHost));
         }
         ok = (st == CUBLAS_STATUS_SUCCESS && c00 == 32) ? 1 : 0;
+#if CUBLAS_VER_MAJOR > 12 || (CUBLAS_VER_MAJOR == 12 && CUBLAS_VER_MINOR >= 5)
         const cublasOperation_t ta[1] = { CUBLAS_OP_T }, tb[1] = { CUBLAS_OP_N };
         const int md[1] = { 32 }, nd[1] = { 32 }, kd[1] = { 32 };
         const int la[1] = { 32 }, lb[1] = { 32 }, lc[1] = { 32 }, gsz[1] = { 1 };
@@ -11534,6 +11535,11 @@ static bool mach1_gg_i8_ok() {
         const cublasStatus_t stg = cublasGemmGroupedBatchedEx(h, ta, tb, md, nd, kd,
             al, ga, CUDA_R_8I, la, gb, CUDA_R_8I, lb,
             be, gc, CUDA_R_32I, lc, 1, gsz, CUBLAS_COMPUTE_32I);
+#else
+        // cublasGemmGroupedBatchedEx needs cuBLAS >= 12.5; stg only feeds the
+        // debug log, the probe verdict above comes from GemmBatchedEx.
+        const cublasStatus_t stg = CUBLAS_STATUS_NOT_SUPPORTED;
+#endif
         if (mach1_debug_on()) {
             fprintf(stderr, "mach1: GG i8 probe GemmBatchedEx status=%d c00=%d, GroupedBatchedEx status=%d\n",
                     (int) st, c00, (int) stg);
