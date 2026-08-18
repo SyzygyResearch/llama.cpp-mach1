@@ -71,6 +71,7 @@ jobs:
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_CUDA=ON \
             -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90" \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
             ${{ env.COMMON_CMAKE_ARGS }}
           cmake --build build --config Release -j $(nproc)
       - name: Pack

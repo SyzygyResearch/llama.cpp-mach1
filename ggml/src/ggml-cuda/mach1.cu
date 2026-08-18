@@ -839,7 +839,9 @@ static const half * mach1_tc_htab(int device, cudaStream_t stream) {
         half * t = h.data() + mach1_tc_hoff(s);
         for (int r = 0; r < s; ++r) {
             for (int c = 0; c < s; ++c) {
-                t[r*s + c] = __float2half((__builtin_popcount(r & c) & 1) ? -1.0f : 1.0f);
+                int par = r & c; // parity via xor-fold: MSVC has no __builtin_popcount
+                par ^= par >> 4; par ^= par >> 2; par ^= par >> 1;
+                t[r*s + c] = __float2half((par & 1) ? -1.0f : 1.0f);
             }
         }
     }
