@@ -1,0 +1,80 @@
+#version 450
+
+// Mach-1 transform-free Lloyd bitshift-trellis GEMM (see ggml_mach1_ne_mm).
+// One thread per output row x token-tile: the L=12 register walk decodes the
+// row once per tile of up to 8 tokens, accumulating dots on the fly.
+// W[r,t] = f32(lut[chunk(r)][state]) * f32(gscale[r][t/128]).
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define TOK_TILE 8u
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint B;              // output rows
+    uint T;              // input dim
+    uint k;              // fresh bits per step (3 or 4)
+    uint ng;             // groups per row (T/128)
+    uint rows_per_chunk; // B / n_lut_chunks
+    uint n_tokens;
+};
+
+// packed bytes are read as uint words (the backend does not enable 8-bit storage)
+layout(binding = 0) readonly buffer PBuf   { uint      packed_q[]; };
+layout(binding = 1) readonly buffer GBuf   { float16_t gscale[]; };
+layout(binding = 2) readonly buffer LBuf   { float16_t lut[]; };
+layout(binding = 3) readonly buffer XBuf   { float     x[]; };
+layout(binding = 4) writeonly buffer DstBuf { float dst[]; };
+
+uint p_byte(uint i) {
+    return (packed_q[i >> 2] >> ((i & 3u)*8u)) & 0xFFu;
+}
+
+void main() {
+    const uint r = gl_GlobalInvocationID.x;
+    if (r >= B) {
+        return;
+    }
+    const uint jt0 = gl_WorkGroupID.y * TOK_TILE;
+    const uint njt = min(TOK_TILE, n_tokens - jt0);
+
+    const uint row_bytes = (T*k)/8u;
+    const uint lut_off   = (r / rows_per_chunk) * 4096u;
+    const uint kmask     = (1u << k) - 1u;
+
+    float accs[TOK_TILE];
+    [[unroll]] for (uint j = 0; j < TOK_TILE; ++j) {
+        accs[j] = 0.0f;
+    }
+
+    uint pbi   = r*row_bytes;
+    uint acc   = 0;
+    uint nbits = 0;
+    uint state = 0;
+    for (uint g = 0; g < ng; ++g) {
+        const float gsc = float(gscale[r*ng + g]);
+        for (uint t = 0; t < 128u; ++t) {
+            while (nbits < k) {
+                acc = (acc << 8) | p_byte(pbi);
+                pbi++;
+                nbits += 8u;
+            }
+            nbits -= k;
+            state = ((state << k) | ((acc >> nbits) & kmask)) & 0xFFFu;
+            const float w = float(lut[lut_off + state]) * gsc;
+            const uint idx = g*128u + t;
+            [[unroll]] for (uint j = 0; j < TOK_TILE; ++j) {
+                if (j < njt) {
+                    accs[j] += w * x[(jt0 + j)*T + idx];
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint j = 0; j < TOK_TILE; ++j) {
+        if (j < njt) {
+            dst[(jt0 + j)*B + r] = accs[j];
+        }
+    }
+}

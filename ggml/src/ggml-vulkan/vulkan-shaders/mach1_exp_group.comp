@@ -1,0 +1,80 @@
+#version 450
+
+// Mach-1 expert tier, phase 0: group (slot, token) pairs by storage expert.
+// Single workgroup. Scratch int layout (element offsets, G = n_groups):
+//   [0,G) cnt | [G,2G) off | [2G,3G) orig | [3G,4G) cursor (unused) | [4G,4G+P) pairs
+// pairs holds the flat pair rank p = t*n_used + s, sorted by group.
+//
+// Counts, prefix sums, and scatter cursors live in SHARED memory (barrier()
+// guarantees shared coherence; it does NOT make plain SSBO stores visible
+// across invocations without a coherent qualifier). Every storage-buffer
+// element therefore has exactly one writer inside this dispatch, and the
+// consumers (walk/out) read the tables through the pipeline barrier.
+
+#extension GL_EXT_control_flow_attributes : require
+
+#define GGML_MACH1_DEM_FLAG 0x40000000u
+#define MAX_GROUPS 512u   // enforced by supports_op (n_kept + n_dem <= 512)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n_used;
+    uint n_tok;
+    uint n_kept;
+    uint n_groups;
+    uint ids_s0;    // ids element strides
+    uint ids_s1;
+};
+
+layout(binding = 0) readonly buffer RBuf { int remap[]; };
+layout(binding = 1) readonly buffer IBuf { int ids[]; };
+layout(binding = 2) writeonly buffer SBuf { int scr[]; };
+
+shared int sh_cnt[MAX_GROUPS];
+shared int sh_cur[MAX_GROUPS];
+shared int sh_orig[MAX_GROUPS];
+
+uint group_of(uint p) {
+    const uint s = p % n_used;
+    const uint t = p / n_used;
+    const uint id = uint(ids[s*ids_s0 + t*ids_s1]);
+    const uint rm = uint(remap[id]);
+    return (rm & GGML_MACH1_DEM_FLAG) != 0u ? n_kept + (rm & ~GGML_MACH1_DEM_FLAG) : rm;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint P   = n_used * n_tok;
+
+    for (uint g = tid; g < n_groups; g += 256u) {
+        sh_cnt[g]  = 0;
+        sh_orig[g] = 0;
+    }
+    barrier();
+    for (uint p = tid; p < P; p += 256u) {
+        const uint s = p % n_used;
+        const uint t = p / n_used;
+        const uint g = group_of(p);
+        atomicAdd(sh_cnt[g], 1);
+        atomicExchange(sh_orig[g], ids[s*ids_s0 + t*ids_s1]);   // orig id (same value per group)
+    }
+    barrier();
+    if (tid == 0u) {
+        int off = 0;
+        for (uint g = 0; g < n_groups; ++g) {
+            const int c = sh_cnt[g];
+            sh_cur[g] = off;
+            scr[g]               = c;            // cnt
+            scr[n_groups + g]    = off;          // off
+            scr[2u*n_groups + g] = sh_orig[g];   // orig id
+            off += c;
+        }
+    }
+    barrier();
+    for (uint p = tid; p < P; p += 256u) {
+        const uint g = group_of(p);
+        const int pos = atomicAdd(sh_cur[g], 1);
+        scr[4u*n_groups + uint(pos)] = int(p);
+    }
+}

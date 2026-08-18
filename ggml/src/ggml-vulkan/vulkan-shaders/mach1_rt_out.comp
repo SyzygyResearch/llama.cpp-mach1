@@ -1,0 +1,49 @@
+#version 450
+
+// Mach-1 rotated NE spine (payload v3), phase 3: y[:, t] = sv ⊙ H_m(v[:, t]).
+// One workgroup per token; FWHT in shared memory (m up to 8192 = 32 KB shared,
+// gated by supports_op on maxComputeSharedMemorySize). sv is F32 with the
+// per-matrix F32 Wscale folded in at export.
+
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint m;
+    uint n;
+    uint n_tok;
+};
+
+layout(binding = 0) readonly buffer SvBuf { float sv[]; };
+layout(binding = 1) readonly buffer FBuf  { float scr[]; };
+layout(binding = 2) writeonly buffer DstBuf { float dst[]; };
+
+shared float sh[8192];
+
+void main() {
+    const uint t   = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint v_base = n_tok*n;
+
+    for (uint i = tid; i < m; i += WG) {
+        sh[i] = scr[v_base + t*m + i];
+    }
+    barrier();
+    for (uint span = 1u; span < m; span <<= 1) {
+        for (uint b = tid; b < m/2u; b += WG) {
+            const uint base = (b / span) * (span << 1) + (b % span);
+            const float a0 = sh[base];
+            const float a1 = sh[base + span];
+            sh[base]        = a0 + a1;
+            sh[base + span] = a0 - a1;
+        }
+        barrier();
+    }
+    const float sc = sqrt(float(m));
+    for (uint i = tid; i < m; i += WG) {
+        dst[t*m + i] = (sh[i] / sc) * sv[i];
+    }
+}

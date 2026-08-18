@@ -1,0 +1,79 @@
+#version 450
+
+// Mach-1 int5-g64 lm_head matmul (payload v3): W[r,j] = q * f32(gscale[r][j/64])
+// with q int5 in [-16,15], 8 codes per 5 little-endian bytes. One thread per
+// output row x token-tile, accumulating dots on the fly.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define TOK_TILE 8u
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n;          // reduction dim
+    uint vocab;      // output rows
+    uint n_tokens;
+};
+
+// packed bytes are read as uint words (the backend does not enable 8-bit storage)
+layout(binding = 0) readonly buffer QBuf   { uint      qp[]; };
+layout(binding = 1) readonly buffer GBuf   { float16_t gscale[]; };
+layout(binding = 2) readonly buffer XBuf   { float     x[]; };
+layout(binding = 3) writeonly buffer DstBuf { float dst[]; };
+
+uint q_byte(uint i) {
+    return (qp[i >> 2] >> ((i & 3u)*8u)) & 0xFFu;
+}
+
+void main() {
+    const uint r = gl_GlobalInvocationID.x;
+    if (r >= vocab) {
+        return;
+    }
+    const uint jt0 = gl_WorkGroupID.y * TOK_TILE;
+    const uint njt = min(TOK_TILE, n_tokens - jt0);
+
+    const uint row_bytes = n/8u*5u;
+    const uint ng        = n/64u;
+
+    float accs[TOK_TILE];
+    [[unroll]] for (uint j = 0; j < TOK_TILE; ++j) {
+        accs[j] = 0.0f;
+    }
+
+    const uint pb = r*row_bytes;
+    for (uint blk = 0; blk < n/8u; ++blk) {
+        // 40-bit little-endian block: code i at bits [5i, 5i+5), value q+16
+        const uint b0 = q_byte(pb + blk*5u + 0u);
+        const uint b1 = q_byte(pb + blk*5u + 1u);
+        const uint b2 = q_byte(pb + blk*5u + 2u);
+        const uint b3 = q_byte(pb + blk*5u + 3u);
+        const uint b4 = q_byte(pb + blk*5u + 4u);
+        const uint lo = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        [[unroll]] for (uint i = 0; i < 8u; ++i) {
+            const uint bit0 = 5u*i;
+            uint qv;
+            if (bit0 + 5u <= 32u) {
+                qv = (lo >> bit0) & 31u;                       // fully in b0..b3
+            } else if (bit0 >= 32u) {
+                qv = (b4 >> (bit0 - 32u)) & 31u;               // fully in b4
+            } else {
+                qv = ((lo >> bit0) | (b4 << (32u - bit0))) & 31u;   // straddles
+            }
+            const uint j = blk*8u + i;
+            const float w = float(int(qv) - 16) * float(gscale[r*ng + (j >> 6)]);
+            [[unroll]] for (uint jt = 0; jt < TOK_TILE; ++jt) {
+                if (jt < njt) {
+                    accs[jt] += w * x[(jt0 + jt)*n + j];
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint j = 0; j < TOK_TILE; ++j) {
+        if (j < njt) {
+            dst[(jt0 + j)*vocab + r] = accs[j];
+        }
+    }
+}

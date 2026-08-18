@@ -1,0 +1,110 @@
+#version 450
+
+// Mach-1 rotated NE spine (payload v3), phase 2: v[:, t] = hatWr @ u[:, t] via
+// the K=4 V=2 bitshift trellis (64 int16 words per 16x16 tile, 8 fresh bits
+// per step, quantlut_sym tlut [512,2]). Grid: x = tile-rows (m/16),
+// z = tokens. One thread per tile column (up to 256 for the 4096-wide
+// out_proj); the tile is re-walked per token (decode has one token).
+//
+// DIRECT-WINDOW states (verified bit-identical to the reference's serial
+// shift-register walk on the shipped payload): the register state at step j
+// is the 16-bit window of the tile's MSB-first stream STARTING at bit
+// (K*V)*j, wrapping at the tile end. K*V = 8 here, so every state is a
+// BYTE-aligned window — state j is just the big-endian u16 at byte offset j.
+// A 16-bit word of the stream is the LE-loaded uint16 verbatim, so state j is
+// word[j/2] for even j and (word[j/2] << 8 | word[j/2 + 1] >> 8) for odd j.
+// No serial dependency: all 8 states of a tile row (and their LUT gathers)
+// are independent, so the loads pipeline instead of serializing.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint m;
+    uint n;
+    uint n_tok;
+};
+
+layout(binding = 0) readonly buffer KBuf { uint16_t trellis[]; };
+layout(binding = 1) readonly buffer TBuf { float16_t tlut[]; };
+layout(binding = 2) buffer FBuf { float scr[]; };
+
+shared float red[16][WG];
+
+void main() {
+    const uint t   = gl_WorkGroupID.z;
+    const uint tr  = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint words   = 64u;
+    const uint tiles_y = n / 16u;
+    const uint tbase   = (tr*tiles_y)*words;
+    const bool have    = tid < tiles_y;
+    const uint v_base  = n_tok*n;
+
+    if (have) {
+        const uint tw = tbase + tid*words;
+        const uint ub = t*n + tid*16u;
+
+        // the tile column's 16 u values are shared by all 16 tile rows
+        float uu[16];
+        [[unroll]] for (uint c = 0; c < 16u; ++c) {
+            uu[c] = scr[ub + c];
+        }
+
+        for (uint ri = 0; ri < 16u; ++ri) {
+            // row ri covers stream bytes [8*ri, 8*ri+8] -> words [4*ri, 4*ri+4]
+            uint w[5];
+            [[unroll]] for (uint q = 0; q < 5u; ++q) {
+                w[q] = uint(trellis[tw + ((4u*ri + q) & 63u)]);   // only q=4,ri=15 wraps
+            }
+            // 8 independent states, then 8 independent LUT gathers
+            uint ph[8];
+            [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                const uint hi = w[j >> 1];
+                const uint st = (j & 1u) == 0u ? hi
+                                               : (((hi << 8) | (w[(j >> 1) + 1u] >> 8)) & 0xFFFFu);
+                ph[j] = st*(st + 1u);
+            }
+            float v0[8], v1[8];
+            [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                const uint row = (ph[j] >> 6) & 511u;
+                // tlut ships pre-rounded to fp16 (the reference rounds hatWr to
+                // fp16 anyway, and rounding is idempotent) -> half the LUT bytes
+                v0[j] = float(tlut[2u*row + 0u]);
+                v1[j] = float(tlut[2u*row + 1u]);
+            }
+            // same accumulation order as the serial walk: per state, w0 then w1
+            float acc = 0.0f;
+            [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                float a0 = v0[j];
+                if ((ph[j] & 0x8000u) != 0u) {
+                    a0 = -a0;
+                }
+                acc += a0*uu[2u*j] + v1[j]*uu[2u*j + 1u];
+            }
+            red[ri][tid] = acc;
+        }
+    } else {
+        [[unroll]] for (uint i = 0; i < 16u; ++i) {
+            red[i][tid] = 0.0f;
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = WG/2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint i = 0; i < 16u; ++i) {
+                red[i][tid] += red[i][tid + s];
+            }
+        }
+        barrier();
+    }
+    if (tid < 16u) {
+        scr[v_base + t*m + tr*16u + tid] = red[tid][0];
+    }
+}

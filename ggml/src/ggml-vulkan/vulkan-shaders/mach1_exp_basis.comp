@@ -1,0 +1,76 @@
+#version 450
+
+// Mach-1 shared low-rank basis residual for demoted experts (see
+// ggml_mach1_exp_basis): y = B (c_e ⊙ (A x)) in fp32; kept slots emit zeros.
+// One workgroup per (slot, token) pair. When has_acc is set, dst = acc + y
+// (the fused form of the ggml_add that would otherwise follow); acc_in is
+// bound to dst when absent and never read.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define GGML_MACH1_DEM_FLAG 0x40000000u
+#define WG 256u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n;
+    uint r;
+    uint m;
+    uint n_used;
+    uint xne1;
+    uint ids_s0;
+    uint ids_s1;
+    uint has_acc;
+};
+
+layout(binding = 0) readonly buffer ABuf { float16_t a[]; };
+layout(binding = 1) readonly buffer BBuf { float16_t b[]; };
+layout(binding = 2) readonly buffer CBuf { float16_t c[]; };
+layout(binding = 3) readonly buffer RBuf { int remap[]; };
+layout(binding = 4) readonly buffer IBuf { int ids[]; };
+layout(binding = 5) readonly buffer XBuf { float x[]; };
+layout(binding = 6) readonly buffer AccBuf { float acc_in[]; };
+layout(binding = 7) writeonly buffer DstBuf { float dst[]; };
+
+shared float tv[256];
+
+void main() {
+    // 2D grid (x = slot, y = token) so no dispatch dimension exceeds
+    // max(n_used, n_tok) — stays under the spec-minimum 65535 limit
+    const uint s   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint id  = uint(ids[s*ids_s0 + t*ids_s1]);
+    const uint rm  = uint(remap[id]);
+
+    const uint obase = t*n_used*m + s*m;
+    if ((rm & GGML_MACH1_DEM_FLAG) == 0u) {
+        for (uint i = tid; i < m; i += WG) {
+            dst[obase + i] = has_acc != 0u ? acc_in[obase + i] : 0.0f;
+        }
+        return;
+    }
+    const uint di = rm & ~GGML_MACH1_DEM_FLAG;
+    const uint xbase = (xne1 == 1u ? 0u : s*n) + t*xne1*n;
+
+    // t_j = c_j * (A_j . x)
+    for (uint j = tid; j < r; j += WG) {
+        float acc = 0.0f;
+        for (uint i = 0; i < n; ++i) {
+            acc += float(a[j*n + i]) * x[xbase + i];
+        }
+        tv[j] = float(c[di*r + j]) * acc;
+    }
+    barrier();
+    for (uint i = tid; i < m; i += WG) {
+        float acc = 0.0f;
+        for (uint j = 0; j < r; ++j) {
+            // keep the reference's two-rounding order (no mul+add contraction)
+            precise float prod = float(b[i*r + j]) * tv[j];
+            acc += prod;
+        }
+        dst[obase + i] = has_acc != 0u ? acc_in[obase + i] + acc : acc;
+    }
+}
