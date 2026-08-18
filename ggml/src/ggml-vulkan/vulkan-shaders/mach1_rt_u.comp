@@ -1,0 +1,45 @@
+#version 450
+
+// Mach-1 rotated NE spine (payload v3), phase 1: u = H_n(su ⊙ x) per token.
+// One workgroup per token; FWHT in shared memory. su is F32 (int8 signs).
+// Scratch half layout: u [T, n] then v [T, m].
+
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n;
+};
+
+layout(binding = 0) readonly buffer SuBuf { float su[]; };
+layout(binding = 1) readonly buffer XBuf  { float x[]; };
+layout(binding = 2) writeonly buffer FBuf { float scr[]; };
+
+shared float sh[4096];
+
+void main() {
+    const uint t   = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    for (uint i = tid; i < n; i += WG) {
+        sh[i] = su[i] * x[t*n + i];
+    }
+    barrier();
+    for (uint span = 1u; span < n; span <<= 1) {
+        for (uint b = tid; b < n/2u; b += WG) {
+            const uint base = (b / span) * (span << 1) + (b % span);
+            const float a0 = sh[base];
+            const float a1 = sh[base + span];
+            sh[base]        = a0 + a1;
+            sh[base + span] = a0 - a1;
+        }
+        barrier();
+    }
+    const float sc = sqrt(float(n));
+    for (uint i = tid; i < n; i += WG) {
+        scr[t*n + i] = sh[i] / sc;
+    }
+}

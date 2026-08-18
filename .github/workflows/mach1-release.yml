@@ -1,0 +1,219 @@
+# Prebuilt binaries for the mach1 fork.
+#
+# Self-contained on purpose: upstream's release.yml stays untouched so it
+# never conflicts on a rebase (see REBASE.md). It also carries jobs this fork
+# has no use for. The build steps here are copied from the upstream jobs that
+# are known to work in this tree.
+#
+# GPU archives only, for now. The CPU path is a vectorised reference
+# implementation (AVX-512 / AVX2 / NEON) and sits roughly 3x behind Q4_K_M
+# decode on AVX2 hosts and ~5x on AVX-512 ones (see README.md), so a CPU-only
+# archive would underwhelm next to what people expect from llama.cpp CPU
+# numbers. TODO: decide whether to publish a CPU archive anyway now that the
+# walk is vectorised. macOS is served by a Vulkan build through MoltenVK
+# (there are no Metal codec kernels), which needs a MoltenVK SDK step nobody
+# has exercised here yet - Mac users build from source for now, per the
+# README.
+#
+#
+# Tagging follows the upstream-build + fork-sha convention (see RELEASE.md):
+#   git tag mach1-main-b<upstream build number>-<short sha> && git push origin <tag>
+name: mach1 release
+
+on:
+  push:
+    tags:
+      - 'mach1-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and publish'
+        required: true
+        type: string
+
+env:
+  # release builds must not bake in the builder's ISA
+  COMMON_CMAKE_ARGS: >-
+    -DGGML_NATIVE=OFF
+    -DLLAMA_BUILD_UI=OFF
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.t.outputs.name }}
+    steps:
+      - id: t
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+  linux-cuda:
+    needs: tag
+    strategy:
+      matrix:
+        cuda: ['12.4.1', '12.8.0']
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential cmake git libssl-dev
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90" \
+            ${{ env.COMMON_CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
+      - name: Pack
+        run: |
+          cp LICENSE README.md ./build/bin/
+          tar -czf mach1-${{ needs.tag.outputs.name }}-linux-cuda-${{ matrix.cuda }}.tar.gz -C ./build/bin .
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mach1-linux-cuda-${{ matrix.cuda }}
+          path: mach1-*.tar.gz
+
+  linux-vulkan:
+    needs: tag
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Dependencies
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev
+      - uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: mach1-release-ubuntu-22.04-vulkan
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_VULKAN=ON \
+            ${{ env.COMMON_CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
+      - name: Pack
+        run: |
+          cp LICENSE README.md ./build/bin/
+          tar -czf mach1-${{ needs.tag.outputs.name }}-linux-vulkan-x64.tar.gz -C ./build/bin .
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mach1-linux-vulkan-x64
+          path: mach1-*.tar.gz
+
+  windows-cuda:
+    needs: tag
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        cuda: ['12.4']
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install CUDA toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+      - name: Install Ninja
+        run: choco install ninja
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DLLAMA_BUILD_UI=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90"
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+      - name: Pack
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE, README.md build/bin/Release/
+          Compress-Archive -Path build/bin/Release/* -DestinationPath mach1-${{ needs.tag.outputs.name }}-windows-cuda-${{ matrix.cuda }}.zip
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mach1-windows-cuda-${{ matrix.cuda }}
+          path: mach1-*.zip
+
+  windows-vulkan:
+    needs: tag
+    runs-on: windows-2022
+    env:
+      VULKAN_VERSION: 1.4.313.2
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+      - name: Install Ninja
+        run: choco install ninja
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" -DGGML_NATIVE=OFF -DLLAMA_BUILD_UI=OFF -DGGML_VULKAN=ON
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+      - name: Pack
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE, README.md build/bin/Release/
+          Compress-Archive -Path build/bin/Release/* -DestinationPath mach1-${{ needs.tag.outputs.name }}-windows-vulkan-x64.zip
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mach1-windows-vulkan-x64
+          path: mach1-*.zip
+
+  publish:
+    needs:
+      - tag
+      - linux-cuda
+      - linux-vulkan
+      - windows-cuda
+      - windows-vulkan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: ./artifacts
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.tag.outputs.name }}
+          name: ${{ needs.tag.outputs.name }}
+          body: |
+            Prebuilt binaries for the mach1 fork of llama.cpp.
+
+            Pick the archive for your hardware: **NVIDIA -> cuda**, **AMD/Intel -> vulkan**.
+            Unpack it and run `llama-cli` or `llama-server` from inside.
+
+            A GPU is strongly recommended. The CPU path is a vectorised reference
+            implementation, roughly 3-5x behind Q4_K_M decode (see the README), so
+            no CPU archive is published.
+
+            ```
+            ./llama-cli -hf SyzygyResearch/Mach-1-Additive-35B-GGUF
+            ```
+
+            Mach-1 checkpoints need these builds - stock llama.cpp cannot load them.
+            Do not mix these `ggml-*` libraries with a stock llama.cpp build.
+          files: ./artifacts/*

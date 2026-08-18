@@ -1,0 +1,174 @@
+#version 450
+
+// Mach-1 expert tier, phase 2: v[:, pair] += Wunit_e @ u[:, pair] via the
+// bitshift trellis (quantlut_sym). Grid: x = tile-rows (m/16), z = groups
+// (workgroups of empty groups exit immediately). One thread per tile column;
+// the tail-biting L=16 walk decodes each 16x16 tile and dots it against the
+// group's tokens (re-walked per token; generation has one token per group).
+//
+// Two compiled variants:
+//   default    — payload v2: V=2, K=2 kept / K=1 demoted, tlut F32 [512,2],
+//                row = (p>>6)&511
+//   MACH1_V8   — payload v3: V=8, K=1.5 (24 words/tile, 12 fresh bits/step),
+//                tlut F16 [32768,8] (pre-rounded at export — the decode spec
+//                rounds hatWr to fp16 anyway, so it is bit-exact and halves
+//                the gather), row = p&0x7FFF, per-tile wave_gamma applied
+//                after the fp16 round (binding 5; expert row = orig id from
+//                the group table), no demoted tier
+//
+// DIRECT-WINDOW states: the shift register after step i holds exactly the
+// 16-bit window of the tile's MSB-first stream starting at bit step*i
+// (wrapping) — verified bit-identical to the reference's serial walk on the
+// shipped payloads. steps*step == words*16, so the bit offset never needs a
+// modulo and only the word pair wraps. Every step is independent, so the LUT
+// gathers pipeline instead of serializing behind the register shift.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 128u
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint m;
+    uint n;
+    uint n_kept;
+    uint n_groups;
+    uint u_off;
+    uint v_off;
+};
+
+layout(binding = 0) readonly buffer KBuf { uint16_t kept[]; };
+layout(binding = 1) readonly buffer DBuf { uint16_t dem[]; };
+#ifdef MACH1_V8
+layout(binding = 2) readonly buffer TBuf { float16_t tlut[]; };
+#else
+layout(binding = 2) readonly buffer TBuf { float tlut[]; };
+#endif
+layout(binding = 3) readonly buffer SBuf { int scr_i[]; };
+layout(binding = 4) buffer FBuf { float scr_f[]; };
+#ifdef MACH1_V8
+layout(binding = 5) readonly buffer GBuf { float16_t gamma[]; };
+#endif
+
+shared float red[16][WG];
+
+void main() {
+    const uint g   = gl_WorkGroupID.z;
+    const uint tr  = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const int cnt = scr_i[g];
+    if (cnt == 0) {
+        return;
+    }
+    const uint off      = uint(scr_i[n_groups + g]);
+    const uint tiles_y  = n / 16u;
+    const uint ntiles   = (m / 16u) * tiles_y;
+    const bool have     = tid < tiles_y;
+#ifdef MACH1_V8
+    const uint words    = 24u;
+    const uint step     = 12u;
+    const uint STEPS    = 32u;
+    const uint tbase    = g*ntiles*words + (tr*tiles_y)*words;
+    // per-tile wave gamma: last anti-diagonal wavefront writing tile (tr, tid)
+    const uint e_orig   = uint(scr_i[2u*n_groups + g]);
+    const uint Mb       = m / 16u;
+    float gsc = 0.0f;
+    if (have) {
+        const uint wv = (tr + tid <= tiles_y - 1u) ? Mb + tiles_y - 1u - (tr + tid)
+                                                   : Mb + tiles_y - 2u - (tr + tid);
+        gsc = float(gamma[e_orig*(Mb + tiles_y) + wv]);
+    }
+#else
+    const bool is_dem   = g >= n_kept;
+    const uint ei       = is_dem ? g - n_kept : g;
+    const uint words    = is_dem ? 16u : 32u;
+    const uint step     = is_dem ? 2u : 4u;
+    const uint STEPS    = 128u;
+    const uint tbase    = ei*ntiles*words + (tr*tiles_y)*words;
+#endif
+
+    // MEASURED (2026-08-03, M4 Pro): blocking pairs 2-at-a-time to halve the
+    // per-pair tile decode is 3x SLOWER on prefill (21.7 vs 64.8 tok/s @1547
+    // tok) and 34% slower on decode — the second partial[16] accumulator
+    // doubles the indexed-array footprint, which spills to private memory and
+    // collapses occupancy. Amortizing the decode across a group's pairs needs
+    // a decomposition change (one thread per output row + subgroup reduction),
+    // not extra accumulators. Left one pair per iteration.
+    for (uint q = 0; q < uint(cnt); ++q) {
+        const uint p = uint(scr_i[4u*n_groups + off + q]);
+
+        float partial[16];
+        [[unroll]] for (uint i = 0; i < 16u; ++i) {
+            partial[i] = 0.0f;
+        }
+        if (have) {
+            const uint tw = tbase + tid*words;
+            const uint ub = u_off + p*n + tid*16u;
+            for (uint i = 0; i < STEPS; ++i) {
+                // direct-window state: 16 bits at stream bit step*i (wrapping)
+                const uint b   = step*i;
+                const uint wi  = b >> 4;
+                const uint o   = b & 15u;
+                const uint wn  = wi + 1u < words ? wi + 1u : 0u;
+#ifdef MACH1_V8
+                const uint w2  = (uint(kept[tw + wi]) << 16) | uint(kept[tw + wn]);
+#else
+                const uint w2  = is_dem
+                    ? ((uint(dem[tw + wi])  << 16) | uint(dem[tw + wn]))
+                    : ((uint(kept[tw + wi]) << 16) | uint(kept[tw + wn]));
+#endif
+                const uint reg = (w2 >> (16u - o)) & 0xFFFFu;
+
+                const uint ph  = reg*(reg + 1u);
+#ifdef MACH1_V8
+                const uint row = ph & 0x7FFFu;
+                const uint ri  = (8u*i) >> 4;
+                const uint ci  = (8u*i) & 15u;
+                float dotp = 0.0f;
+                [[unroll]] for (uint c = 0; c < 8u; ++c) {
+                    // tlut is pre-rounded fp16 (bit-exact vs rounding here);
+                    // wave gamma then multiplies in fp32 (reference op order)
+                    float vv = float(tlut[8u*row + c]);
+                    if (c == 0u && (ph & 0x8000u) != 0u) {
+                        vv = -vv;                 // exact in fp16 (sign bit)
+                    }
+                    dotp += (vv * gsc) * scr_f[ub + ci + c];
+                }
+                partial[ri] += dotp;
+#else
+                const uint row = (ph >> 6) & 511u;
+                float v0 = tlut[2u*row + 0u];
+                const float v1raw = tlut[2u*row + 1u];
+                if ((ph & 0x8000u) != 0u) {
+                    v0 = -v0;
+                }
+                const float w0 = float(float16_t(v0));
+                const float w1 = float(float16_t(v1raw));
+                const uint ri = (2u*i) >> 4;
+                const uint ci = (2u*i) & 15u;
+                partial[ri] += w0*scr_f[ub + ci] + w1*scr_f[ub + ci + 1u];
+#endif
+            }
+        }
+        [[unroll]] for (uint i = 0; i < 16u; ++i) {
+            red[i][tid] = partial[i];
+        }
+        barrier();
+        [[unroll]] for (uint s = WG/2u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                [[unroll]] for (uint i = 0; i < 16u; ++i) {
+                    red[i][tid] += red[i][tid + s];
+                }
+            }
+            barrier();
+        }
+        if (tid < 16u) {
+            scr_f[v_off + p*m + tr*16u + tid] = red[tid][0];
+        }
+        barrier();
+    }
+}

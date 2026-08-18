@@ -1,0 +1,59 @@
+#version 450
+
+// Mach-1 expert tier, phase 1: u = H_n(su_e ⊙ x) per (slot, token) pair.
+// One workgroup per pair; FWHT in shared memory (orthonormal, single final
+// division by sqrt(n)). u is stored pair-major at u_off in the f32 scratch.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n;
+    uint n_used;
+    uint xne1;      // 1 (broadcast) or n_used
+    uint u_off;     // f32 element offset of u in scratch
+    uint ids_s0;
+    uint ids_s1;
+};
+
+layout(binding = 0) readonly buffer SuBuf { float16_t su[]; };
+layout(binding = 1) readonly buffer IBuf  { int ids[]; };
+layout(binding = 2) readonly buffer XBuf  { float x[]; };
+layout(binding = 3) buffer FBuf { float scr[]; };
+
+shared float sh[2048];
+
+void main() {
+    // 2D grid (x = slot, y = token) so no dispatch dimension exceeds
+    // max(n_used, n_tok) — stays under the spec-minimum 65535 limit
+    const uint s   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint p   = t*n_used + s;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint e   = uint(ids[s*ids_s0 + t*ids_s1]);
+
+    const uint xbase = (xne1 == 1u ? 0u : s*n) + t*xne1*n;
+    for (uint i = tid; i < n; i += WG) {
+        sh[i] = float(su[e*n + i]) * x[xbase + i];
+    }
+    barrier();
+
+    for (uint span = 1u; span < n; span <<= 1) {
+        for (uint b = tid; b < n/2u; b += WG) {
+            const uint base = (b / span) * (span << 1) + (b % span);
+            const float a0 = sh[base];
+            const float a1 = sh[base + span];
+            sh[base]        = a0 + a1;
+            sh[base + span] = a0 - a1;
+        }
+        barrier();
+    }
+    const float sc = sqrt(float(n));
+    for (uint i = tid; i < n; i += WG) {
+        scr[u_off + p*n + i] = sh[i] / sc;
+    }
+}

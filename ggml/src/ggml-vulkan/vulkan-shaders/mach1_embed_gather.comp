@@ -1,0 +1,48 @@
+#version 450
+
+// Mach-1 lossless nibble-LUT embedding gather (payload v3): 4-bit codes (low
+// nibble = even column) into per-(row, group-64) bf16 LUT rows. bf16 -> f32
+// widening is the exact bit manipulation u32 = u16 << 16.
+// One invocation per (token, group of 64 elements).
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n_embd;
+    uint n_tokens;
+};
+
+// packed bytes are read as uint words (the backend does not enable 8-bit storage)
+layout(binding = 0) readonly buffer CBuf   { uint      codes[]; };
+layout(binding = 1) readonly buffer LBuf   { uint16_t  lut[]; };
+layout(binding = 2) readonly buffer IdsBuf { int       ids[]; };
+layout(binding = 3) writeonly buffer DstBuf { float dst[]; };
+
+uint c_byte(uint i) {
+    return (codes[i >> 2] >> ((i & 3u)*8u)) & 0xFFu;
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint ng  = n_embd / 64u;
+    if (gid >= n_tokens * ng) {
+        return;
+    }
+    const uint tok = gid / ng;
+    const uint g   = gid % ng;
+    const uint r   = uint(ids[tok]);
+
+    const uint lrow  = (r*ng + g)*16u;
+    const uint cbase = r*(n_embd/2u) + g*32u;
+    const uint obase = tok*n_embd + g*64u;
+    for (uint i = 0; i < 32u; ++i) {
+        const uint by = c_byte(cbase + i);
+        const uint q0 = by & 0x0Fu;
+        const uint q1 = by >> 4;
+        dst[obase + 2u*i    ] = uintBitsToFloat(uint(lut[lrow + q0]) << 16);
+        dst[obase + 2u*i + 1u] = uintBitsToFloat(uint(lut[lrow + q1]) << 16);
+    }
+}

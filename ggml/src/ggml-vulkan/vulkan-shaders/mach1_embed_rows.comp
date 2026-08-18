@@ -1,0 +1,60 @@
+#version 450
+
+// Mach-1 int3 asymmetric grouped embedding gather (see ggml_mach1_embed_rows).
+// One invocation per (token, group): W = mn + q3 * max(mx - mn, 1e-8)/7, fp32,
+// with the q*step product rounded before the add (reference decode order).
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n_embd;
+    uint ng;        // groups per row
+    uint grp;       // group size (n_embd / ng)
+    uint n_tokens;
+    uint row_bytes; // n_embd*3/8
+};
+
+// packed bytes are read as uint words (the backend does not enable 8-bit storage)
+layout(binding = 0) readonly buffer QBuf   { uint      q[]; };
+layout(binding = 1) readonly buffer MnBuf  { float16_t mn[]; };
+layout(binding = 2) readonly buffer MxBuf  { float16_t mx[]; };
+layout(binding = 3) readonly buffer IdsBuf { int       ids[]; };
+layout(binding = 4) writeonly buffer DstBuf { float dst[]; };
+
+uint q_byte(uint i) {
+    return (q[i >> 2] >> ((i & 3u)*8u)) & 0xFFu;
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    if (gid >= n_tokens * ng) {
+        return;
+    }
+    const uint tok = gid / ng;
+    const uint g   = gid % ng;
+    const uint r   = uint(ids[tok]);
+
+    const float mnf  = float(mn[r*ng + g]);
+    const float d    = float(mx[r*ng + g]) - mnf;
+    const float step = (d > 1e-8f ? d : 1e-8f) / 7.0f;
+
+    uint pbi   = r*row_bytes + (g*grp*3u)/8u;   // groups are byte-aligned (grp*3 % 8 == 0)
+    uint acc   = 0;
+    uint nbits = 0;
+    const uint obase = tok*n_embd + g*grp;
+    for (uint t = 0; t < grp; ++t) {
+        while (nbits < 3u) {
+            acc = (acc << 8) | q_byte(pbi);
+            pbi++;
+            nbits += 8u;
+        }
+        nbits -= 3u;
+        const uint qv = (acc >> nbits) & 0x7u;
+        // keep the reference's two-rounding order (no mul+add contraction)
+        precise float prod = float(qv) * step;
+        dst[obase + t] = mnf + prod;
+    }
+}
