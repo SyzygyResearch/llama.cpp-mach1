@@ -1,7 +1,7 @@
 # llama.cpp-mach1
 
-A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) that runs **Mach-1** models.
-Get the model from [SyzygyResearch/Mach-1-Additive-35B-GGUF](https://huggingface.co/SyzygyResearch/Mach-1-Additive-35B-GGUF).
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) that runs **Mach-1** and **Mach-2** models.
+Get the model from [SyzygyResearch/Mach-1-Additive-35B-GGUF](https://huggingface.co/SyzygyResearch/Mach-1-Additive-35B-GGUF), or see [Mach-2-Additive-Medium](#mach-2-additive-medium).
 
 ## Quick start
 
@@ -60,15 +60,17 @@ The multimodal variant pairs the same language GGUF with a projector file — ge
 
 `llama-server` takes the same `--mmproj` flag and accepts images through the OpenAI-compatible `image_url` content part.
 
-## Qwen3.8-Flash-Next
+## Mach-2-Additive-Medium
 
-[SyzygyResearch/Mach-1-Additive-Qwen3.8-Flash-Next-GGUF](https://huggingface.co/SyzygyResearch/Mach-1-Additive-Qwen3.8-Flash-Next-GGUF) is Qwen3.8-Flash-Next at 1.7 bits per weight: one 130 GB file holding 26.7 GB of weights and the model's 102 GB n-gram embedding table. Build with CUDA, then:
+[SyzygyResearch/Mach-2-Additive-Medium-GGUF](https://huggingface.co/SyzygyResearch/Mach-2-Additive-Medium-GGUF) is Qwen3.8-Flash-Next at 1.7 bits per weight: one 130 GB file holding 26.7 GB of weights and the model's 102 GB n-gram embedding table. Build with CUDA, then:
 
 ```sh
-./build/bin/llama-cli -hf SyzygyResearch/Mach-1-Additive-Qwen3.8-Flash-Next-GGUF -ngl 99 -fa on --mlock \
+# interactive chat
+./build/bin/llama-cli -hf SyzygyResearch/Mach-2-Additive-Medium-GGUF -ngl 99 -fa on --mlock \
   --temp 1.0 --top-p 0.95 --top-k 20
 
-./build/bin/llama-server -m Mach-1-Additive-Qwen3.8-Flash-Next.mach1.gguf -ngl 99 -fa on --mlock -c 32768 --jinja \
+# OpenAI-compatible server
+./build/bin/llama-server -hf SyzygyResearch/Mach-2-Additive-Medium-GGUF -ngl 99 -fa on --mlock -c 32768 --jinja \
   --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
@@ -80,7 +82,7 @@ The multimodal variant pairs the same language GGUF with a projector file — ge
 
 ## Notes
 
-- Mach-1 checkpoints need these builds — stock llama.cpp cannot load them, and `llama-quantize` refuses them by design (the weights are already packed code streams).
+- Mach-1 and Mach-2 checkpoints need these builds — stock llama.cpp cannot load them, and `llama-quantize` refuses them by design (the weights are already packed code streams).
 - Codec details and the backend support matrix are in [docs/mach1.md](docs/mach1.md).
 - Everything else works as in [upstream llama.cpp](https://github.com/ggml-org/llama.cpp); see its README for the full tool and server documentation.
 
