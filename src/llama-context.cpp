@@ -15,6 +15,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1328,8 +1329,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    static const bool graph_stat = getenv("LLAMA_GRAPH_STAT") && atoi(getenv("LLAMA_GRAPH_STAT")) != 0;
+    const int64_t t_gs0 = graph_stat ? ggml_time_us() : 0;
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+        if (graph_stat) {
+            fprintf(stderr, "graph_stat: REUSE n_tokens=%d %.3f ms\n",
+                    (int) ubatch.n_tokens, (ggml_time_us() - t_gs0)/1000.0);
+        }
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
@@ -1357,10 +1365,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const int64_t t_gs1 = graph_stat ? ggml_time_us() : 0;
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        if (graph_stat) {
+            fprintf(stderr, "graph_stat: BUILD n_tokens=%d build=%.3f ms alloc=%.3f ms nodes=%d\n",
+                    (int) ubatch.n_tokens, (t_gs1 - t_gs0)/1000.0,
+                    (ggml_time_us() - t_gs1)/1000.0, ggml_graph_n_nodes(gf));
+            static bool dumped = false;
+            if (!dumped && ubatch.n_tokens == 1) {
+                dumped = true;
+                std::map<std::string, int> hist;
+                for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                    hist[ggml_op_name(ggml_graph_node(gf, i)->op)]++;
+                }
+                for (const auto & kv : hist) {
+                    fprintf(stderr, "graph_stat: node %-24s %5d\n", kv.first.c_str(), kv.second);
+                }
+            }
         }
     }
 
@@ -2339,6 +2366,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_MACH1 ||
+        model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());

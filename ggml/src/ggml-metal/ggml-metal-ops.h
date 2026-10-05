@@ -43,6 +43,11 @@ size_t ggml_metal_op_flash_attn_ext_extra_pad(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_blk(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const struct ggml_tensor * op);
 
+size_t ggml_metal_op_mach1_da_mm_extra   (const struct ggml_tensor * op);
+size_t ggml_metal_op_mach1_da_embed_extra(const struct ggml_tensor * op);
+size_t ggml_metal_op_mach1_d4_mm_extra   (const struct ggml_tensor * op);
+size_t ggml_metal_op_mach1_rt_mm_extra   (const struct ggml_tensor * op);
+
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_acc               (ggml_metal_op_t ctx, int idx);
@@ -59,6 +64,13 @@ int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mach1_da_mm       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mach1_int_mm      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mach1_da_embed    (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mach1_d4_mm       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mach1_rt_mm       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mach1_head_mm     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mach1_embed_gather(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_cpy               (ggml_metal_op_t ctx, int idx);

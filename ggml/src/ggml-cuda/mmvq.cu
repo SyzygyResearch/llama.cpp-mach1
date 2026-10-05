@@ -1287,3 +1287,24 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
+
+void ggml_cuda_mul_mat_vec_q_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * src1_q8_1,
+                                  ggml_tensor * dst) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1 && src0->nb[0] == ggml_type_size(src0->type));
+    GGML_ASSERT(ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+
+    const int64_t ne00        = src0->ne[0];
+    const int64_t ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+    const int64_t s01         = src0->nb[1] / ggml_type_size(src0->type);
+    const int64_t s11         = ne10_padded / QK8_1;
+    const int64_t s1          = dst->nb[1] / ggml_type_size(dst->type);
+    const int64_t s2          = dst->nb[2] / ggml_type_size(dst->type);
+    const int64_t s3          = dst->nb[3] / ggml_type_size(dst->type);
+
+    mul_mat_vec_q_switch_type(
+        src0->data, src0->type, src1_q8_1, nullptr, ggml_cuda_mm_fusion_args_device{}, (float *) dst->data, ne00,
+        src0->ne[1], 1, s01, s11, s1,
+        1, 1, 1, s01*src0->ne[1], s11, s2,
+        1, 1, s01*src0->ne[1], s11, s3, 0, ctx.stream());
+}

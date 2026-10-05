@@ -2090,6 +2090,102 @@ struct llama_model_qwen35moe : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llama_model_qwen4exp : public llama_model_base {
+    llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct m1_rt {
+        ggml_tensor * trellis = nullptr;
+        ggml_tensor * su      = nullptr;
+        ggml_tensor * sv      = nullptr;
+        ggml_tensor * tlut    = nullptr;
+        int64_t       n_out   = 0;
+    };
+    struct m1_d4 {
+        ggml_tensor * trellis = nullptr;
+        ggml_tensor * offs    = nullptr;
+        ggml_tensor * su      = nullptr;
+        ggml_tensor * sv      = nullptr;
+        ggml_tensor * gw      = nullptr;
+        ggml_tensor * zt      = nullptr;
+        ggml_tensor * units   = nullptr;
+    };
+
+    struct hc_block {
+        ggml_tensor * norm   = nullptr;
+        ggml_tensor * down   = nullptr;
+        ggml_tensor * up     = nullptr;
+        ggml_tensor * inject = nullptr;
+        m1_rt down_rt, up_rt;
+    };
+    struct ple_block {
+        ggml_tensor * key_proj   = nullptr;
+        ggml_tensor * value_proj = nullptr;
+        ggml_tensor * key_norm   = nullptr;
+        ggml_tensor * query_norm = nullptr;
+        ggml_tensor * conv_norm  = nullptr;
+        ggml_tensor * conv1d     = nullptr;
+        m1_rt key_rt, value_rt;
+    };
+    struct q4x_layer {
+        hc_block  hc_attn;
+        hc_block  hc_ffn;
+        ple_block ple;
+
+        m1_rt wq, wk, wv, wo;
+        m1_rt idx_qk;
+        m1_rt wqkv, wqkv_gate, ssm_alpha, ssm_beta, ssm_out;
+        m1_rt gate_shexp, up_shexp, down_shexp;
+        m1_d4 exps[3];
+    };
+    std::vector<q4x_layer> q4x_layers;
+    hc_block      hc_out;
+    ggml_tensor * ple_ngram_embd = nullptr;
+
+    uint32_t      m1_version     = 0;
+    ggml_tensor * m1_ne_tlut     = nullptr;
+    ggml_tensor * m1_d4_zt       = nullptr;
+    ggml_tensor * m1_d4_units    = nullptr;
+    std::vector<int32_t> m1_d4_hash;
+    ggml_tensor * m1_head_qp     = nullptr;
+    ggml_tensor * m1_head_gscale = nullptr;
+    ggml_tensor * m1_embed_codes = nullptr;
+    ggml_tensor * m1_embed_lut   = nullptr;
+
+    struct ple_hash {
+        uint32_t ngram_size      = 0;
+        uint32_t heads_per_ngram = 0;
+        int32_t  eos             = 0;
+        std::vector<uint64_t> mult;
+        std::vector<uint64_t> head_size;
+        std::vector<uint64_t> head_offset;
+    };
+    std::vector<ple_hash> ple_hashes;
+
+    int32_t qsa_topk_blocks = 0;
+
+    struct graph : public llm_build_delta_net_base {
+        graph(const llama_model_qwen4exp & model, const llm_graph_params & params);
+    private:
+        ggml_tensor * build_hc_pre(ggml_tensor * h, const hc_block & hc, ggml_tensor ** inj, const char * tag, int il);
+        ggml_tensor * build_hc_post(ggml_tensor * h, ggml_tensor * out, ggml_tensor * inj, int il);
+        ggml_tensor * build_ple(ggml_tensor * h, ggml_tensor * rs, llm_graph_input_rs * inp, ggml_tensor * tok, int il);
+        ggml_tensor * build_layer_qsa(llm_graph_input_attn_kv * inp_attn, ggml_tensor * cur, ggml_tensor * inp_pos,
+                                      ggml_tensor * blk_pos, ggml_tensor * blk_valid, int il);
+        ggml_tensor * build_layer_gdn(llm_graph_input_rs * inp, ggml_tensor * rs, ggml_tensor * cur, int il);
+        ggml_tensor * build_layer_ffn(ggml_tensor * cur, int il);
+        ggml_tensor * build_moe_d4(ggml_tensor * cur, int il);
+        ggml_tensor * build_inp_embd_q4x();
+        ggml_tensor * lin(ggml_tensor * w, const m1_rt & c, ggml_tensor * x);
+        ggml_tensor * v_heads(ggml_tensor * y, int64_t hd, bool to_tiled);
+
+        const llama_model_qwen4exp & model;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 // Mach-1-Additive: qwen35moe weights repacked as trellis code streams (the
 // exporter's schema constants are the producer contract). Hparams and graph
 // topology are inherited from qwen35moe; the tensor set replaces every
@@ -2110,6 +2206,7 @@ struct llama_model_mach1 : public llama_model_qwen35moe {
         ggml_tensor * rt_trellis = nullptr;  // I16 [K*16, ntiles]
         ggml_tensor * rt_su      = nullptr;  // F32 [n]
         ggml_tensor * rt_sv      = nullptr;  // F32 [m] (Wscale folded)
+        ggml_tensor * rt_tlut    = nullptr;
     };
     // one routed-expert projection (bitshift trellis + RHT sides + low-rank basis)
     struct m1_exp {
@@ -2121,6 +2218,9 @@ struct llama_model_mach1 : public llama_model_qwen35moe {
         ggml_tensor * basis_b = nullptr;        // F16 [r, m]
         ggml_tensor * basis_c = nullptr;        // F16 [r, n_dem]
         ggml_tensor * wave_gamma = nullptr;     // F16 [Mb+Nb, 256] (v3 only)
+        ggml_tensor * d4_trellis = nullptr;
+        ggml_tensor * d4_offs    = nullptr;
+        ggml_tensor * d4_gw      = nullptr;
     };
     struct m1_layer {
         m1_ne wq, wk, wv, wo;                   // full-attention layers
@@ -2128,6 +2228,7 @@ struct llama_model_mach1 : public llama_model_qwen35moe {
         m1_ne gate_shexp, up_shexp, down_shexp; // shared expert (all layers)
         ggml_tensor * remap = nullptr;          // I32 [256]
         m1_exp exps[3];                         // gate, up, down
+        ggml_tensor * d4_zt = nullptr, * d4_units = nullptr, * tlut = nullptr;
     };
 
     std::vector<m1_layer> m1_layers;
@@ -2144,6 +2245,10 @@ struct llama_model_mach1 : public llama_model_qwen35moe {
     ggml_tensor * m1_head_gscale  = nullptr;    // F16 [n/64, vocab]
     ggml_tensor * m1_embed_codes  = nullptr;    // I8  [n_embd/2, vocab]
     ggml_tensor * m1_embed_lut    = nullptr;    // BF16 [16, vocab*n_embd/64]
+
+    ggml_tensor * m1_d4_zt        = nullptr;
+    ggml_tensor * m1_d4_units     = nullptr;
+    std::vector<int32_t> m1_d4_hash;
 
     // true when the checkpoint carries stock (dequantized) ffn_*_exps tensors
     // instead of the packed expert tier (P2 hybrid bring-up artifacts)
@@ -2178,6 +2283,66 @@ struct llama_model_mach1 : public llama_model_qwen35moe {
                             int   il);
 
         const llama_model_mach1 & model;
+    };
+};
+
+struct llama_model_mach1_dense : public llama_model_qwen35 {
+    llama_model_mach1_dense(const struct llama_model_params & params) : llama_model_qwen35(params) {}
+    void load_arch_tensors(llama_model_loader & ml) override;
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    struct m1w {
+        ggml_tensor * trellis = nullptr;
+        ggml_tensor * su      = nullptr;
+        ggml_tensor * sv      = nullptr;
+        ggml_tensor * wgamma  = nullptr;
+        ggml_tensor * q       = nullptr;
+        ggml_tensor * mn      = nullptr;
+        ggml_tensor * mx      = nullptr;
+    };
+    struct m1_layer_dense {
+        m1w wq, wk, wv, wo;
+        m1w wqkv, wqkv_gate, ssm_out;
+        m1w gate, up, down;
+    };
+
+    std::vector<m1_layer_dense> m1_layers;
+    ggml_tensor * m1_tlut = nullptr;
+    m1w m1_embed;
+    m1w m1_head_hot;
+    m1w m1_head_cold;
+    ggml_tensor * m1_head_exc_idx  = nullptr;
+    ggml_tensor * m1_head_exc_rows = nullptr;
+
+    struct graph : public llm_build_delta_net_base {
+        graph(const llama_model_mach1_dense & model, const llm_graph_params & params);
+    private:
+        ggml_tensor * da_mm(const m1w & w, ggml_tensor * x, int mode, int split);
+        ggml_tensor * v_tiled(ggml_tensor * y);
+        ggml_tensor * build_inp_embd_mach1();
+        ggml_tensor * build_layer_attn(
+        llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+        ggml_tensor * build_layer_attn_linear(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * cur,
+                            int   il);
+        ggml_tensor * build_layer_ffn(
+                    ggml_tensor * cur,
+                            int   il);
+        ggml_tensor * build_norm_gated(
+                    ggml_tensor * input,
+                    ggml_tensor * weights,
+                    ggml_tensor * gate,
+                            int   layer);
+        std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
+                    ggml_tensor * input,
+                            int   il);
+
+        const llama_model_mach1_dense & model;
     };
 };
 

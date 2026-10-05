@@ -721,6 +721,8 @@ struct llama_model_base : public llama_model {
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
+    ggml_tensor * create_tensor_for_layer(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int il);
+
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);

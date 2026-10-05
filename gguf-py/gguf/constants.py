@@ -443,6 +443,7 @@ class MODEL_ARCH(IntEnum):
     QWEN3VLMOE       = auto()
     QWEN35           = auto()
     QWEN35MOE        = auto()
+    QWEN4EXP         = auto()
     PHI2             = auto()
     PHI3             = auto()
     PHIMOE           = auto()
@@ -964,6 +965,24 @@ class MODEL_TENSOR(IntEnum):
     # eagle3
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
+    QHC_ATTN_NORM          = auto()
+    QHC_ATTN_DOWN          = auto()
+    QHC_ATTN_UP            = auto()
+    QHC_ATTN_INJECT        = auto()
+    QHC_FFN_NORM           = auto()
+    QHC_FFN_DOWN           = auto()
+    QHC_FFN_UP             = auto()
+    QHC_FFN_INJECT         = auto()
+    QHC_OUT_NORM           = auto()
+    QHC_OUT_DOWN           = auto()
+    QHC_OUT_UP             = auto()
+    PLE_NGRAM_EMBD         = auto()
+    PLE_KEY_PROJ           = auto()
+    PLE_VALUE_PROJ         = auto()
+    PLE_KEY_NORM           = auto()
+    PLE_QUERY_NORM         = auto()
+    PLE_CONV_NORM          = auto()
+    PLE_CONV1D             = auto()
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1031,6 +1050,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.QWEN3VLMOE:       "qwen3vlmoe",
     MODEL_ARCH.QWEN35:           "qwen35",
     MODEL_ARCH.QWEN35MOE:        "qwen35moe",
+    MODEL_ARCH.QWEN4EXP:         "qwen4exp",
     MODEL_ARCH.PHI2:             "phi2",
     MODEL_ARCH.PHI3:             "phi3",
     MODEL_ARCH.PHIMOE:           "phimoe",
@@ -1579,6 +1599,24 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
     MODEL_TENSOR.FC:                        "fc",
     MODEL_TENSOR.D2T:                       "d2t",
+    MODEL_TENSOR.QHC_ATTN_NORM:                   "blk.{bid}.hc_attn_norm",
+    MODEL_TENSOR.QHC_ATTN_DOWN:                   "blk.{bid}.hc_attn_down",
+    MODEL_TENSOR.QHC_ATTN_UP:                     "blk.{bid}.hc_attn_up",
+    MODEL_TENSOR.QHC_ATTN_INJECT:                 "blk.{bid}.hc_attn_inject",
+    MODEL_TENSOR.QHC_FFN_NORM:                    "blk.{bid}.hc_ffn_norm",
+    MODEL_TENSOR.QHC_FFN_DOWN:                    "blk.{bid}.hc_ffn_down",
+    MODEL_TENSOR.QHC_FFN_UP:                      "blk.{bid}.hc_ffn_up",
+    MODEL_TENSOR.QHC_FFN_INJECT:                  "blk.{bid}.hc_ffn_inject",
+    MODEL_TENSOR.QHC_OUT_NORM:                    "output_hc_norm",
+    MODEL_TENSOR.QHC_OUT_DOWN:                    "output_hc_down",
+    MODEL_TENSOR.QHC_OUT_UP:                      "output_hc_up",
+    MODEL_TENSOR.PLE_NGRAM_EMBD:                  "ple_ngram_embd",
+    MODEL_TENSOR.PLE_KEY_PROJ:                    "blk.{bid}.ple_key_proj",
+    MODEL_TENSOR.PLE_VALUE_PROJ:                  "blk.{bid}.ple_value_proj",
+    MODEL_TENSOR.PLE_KEY_NORM:                    "blk.{bid}.ple_key_norm",
+    MODEL_TENSOR.PLE_QUERY_NORM:                  "blk.{bid}.ple_query_norm",
+    MODEL_TENSOR.PLE_CONV_NORM:                   "blk.{bid}.ple_conv_norm",
+    MODEL_TENSOR.PLE_CONV1D:                      "blk.{bid}.ple_conv1d",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -2360,6 +2398,56 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HNORM,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+    ],
+    MODEL_ARCH.QWEN4EXP: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.INDEXER_Q_PROJ,
+        MODEL_TENSOR.INDEXER_K_PROJ,
+        MODEL_TENSOR.INDEXER_Q_NORM,
+        MODEL_TENSOR.INDEXER_K_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_INP_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_ALPHA,
+        MODEL_TENSOR.SSM_OUT,
+        MODEL_TENSOR.QHC_ATTN_NORM,
+        MODEL_TENSOR.QHC_ATTN_DOWN,
+        MODEL_TENSOR.QHC_ATTN_UP,
+        MODEL_TENSOR.QHC_ATTN_INJECT,
+        MODEL_TENSOR.QHC_FFN_NORM,
+        MODEL_TENSOR.QHC_FFN_DOWN,
+        MODEL_TENSOR.QHC_FFN_UP,
+        MODEL_TENSOR.QHC_FFN_INJECT,
+        MODEL_TENSOR.QHC_OUT_NORM,
+        MODEL_TENSOR.QHC_OUT_DOWN,
+        MODEL_TENSOR.QHC_OUT_UP,
+        MODEL_TENSOR.PLE_NGRAM_EMBD,
+        MODEL_TENSOR.PLE_KEY_PROJ,
+        MODEL_TENSOR.PLE_VALUE_PROJ,
+        MODEL_TENSOR.PLE_KEY_NORM,
+        MODEL_TENSOR.PLE_QUERY_NORM,
+        MODEL_TENSOR.PLE_CONV_NORM,
+        MODEL_TENSOR.PLE_CONV1D,
     ],
     MODEL_ARCH.PLAMO: [
         MODEL_TENSOR.TOKEN_EMBD,

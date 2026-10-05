@@ -42,14 +42,17 @@
 #define cudaDeviceDisablePeerAccess musaDeviceDisablePeerAccess
 #define cudaDeviceEnablePeerAccess musaDeviceEnablePeerAccess
 #define cudaDeviceGetPCIBusId musaDeviceGetPCIBusId
+#define cudaDeviceGetStreamPriorityRange musaDeviceGetStreamPriorityRange
 #define cudaDeviceProp musaDeviceProp
 #define cudaDeviceSynchronize musaDeviceSynchronize
 #define cudaError_t musaError_t
 #define cudaErrorMemoryAllocation musaErrorMemoryAllocation
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled
+#define cudaEventCreate musaEventCreate
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
 #define cudaEventDisableTiming musaEventDisableTiming
+#define cudaEventElapsedTime musaEventElapsedTime
 #define cudaEventRecord musaEventRecord
 #define cudaEventSynchronize musaEventSynchronize
 #define cudaEvent_t musaEvent_t
@@ -84,6 +87,7 @@
 #define cudaOccupancyMaxPotentialBlockSize musaOccupancyMaxPotentialBlockSize
 #define cudaSetDevice musaSetDevice
 #define cudaStreamCreateWithFlags musaStreamCreateWithFlags
+#define cudaStreamCreateWithPriority musaStreamCreateWithPriority
 #define cudaStreamDestroy musaStreamDestroy
 #define cudaStreamFireAndForget musaStreamFireAndForget
 #define cudaStreamNonBlocking musaStreamNonBlocking
@@ -144,6 +148,9 @@
 #define cudaKernelNodeParams musaKernelNodeParams
 #define cudaStreamCaptureModeRelaxed musaStreamCaptureModeRelaxed
 #define cudaStreamBeginCapture musaStreamBeginCapture
+#define cudaStreamCaptureStatus musaStreamCaptureStatus
+#define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
+#define cudaStreamIsCapturing musaStreamIsCapturing
 #define cudaStreamEndCapture musaStreamEndCapture
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor musaOccupancyMaxActiveBlocksPerMultiprocessor
 

@@ -1,0 +1,46 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint d;
+    uint M;
+    uint mode;
+    uint v_base;
+};
+
+layout(binding = 0) readonly buffer SuBuf { float su[]; };
+layout(binding = 1) readonly buffer XBuf  { float x[]; };
+layout(binding = 2) buffer FBuf { float scr[]; };
+
+shared float sh[4096];
+
+void main() {
+    const uint a   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint c0  = a*M;
+    const uint o   = (mode == 0u ? 0u : v_base) + t*d + c0;
+
+    for (uint i = tid; i < M; i += WG) {
+        sh[i] = mode == 0u ? su[c0 + i] * x[t*d + c0 + i] : scr[o + i];
+    }
+    barrier();
+    for (uint span = 1u; span < M; span <<= 1) {
+        for (uint b = tid; b < M/2u; b += WG) {
+            const uint base = (b / span) * (span << 1) + (b % span);
+            const float a0 = sh[base];
+            const float a1 = sh[base + span];
+            sh[base]        = a0 + a1;
+            sh[base + span] = a0 - a1;
+        }
+        barrier();
+    }
+    for (uint i = tid; i < M; i += WG) {
+        scr[o + i] = sh[i];
+    }
+}

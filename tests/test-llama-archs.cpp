@@ -427,6 +427,9 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK4) {
         return false;
     }
+    if (arch == LLM_ARCH_MACH1 || arch == LLM_ARCH_QWEN4EXP) {
+        return false; // packed codec checkpoints only
+    }
 
     // FIXME some models are segfaulting with WebGPU:
 #ifdef GGML_USE_WEBGPU

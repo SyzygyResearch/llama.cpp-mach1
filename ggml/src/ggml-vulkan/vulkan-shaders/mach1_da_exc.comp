@@ -1,0 +1,43 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n;
+    uint m;
+    uint exc_base;
+};
+
+layout(binding = 0) readonly buffer IBuf { int      eid[]; };
+layout(binding = 1) readonly buffer RBuf { uint16_t erows[]; };
+layout(binding = 2) readonly buffer XBuf { float    x[]; };
+layout(binding = 3) writeonly buffer DstBuf { float dst[]; };
+
+shared float red[WG];
+
+void main() {
+    const uint j   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+
+    float sum = 0.0f;
+    for (uint i = tid; i < n; i += WG) {
+        sum += uintBitsToFloat(uint(erows[j*n + i]) << 16) * x[t*n + i];
+    }
+    red[tid] = sum;
+    barrier();
+    [[unroll]] for (uint s = WG/2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        dst[t*m + uint(eid[j]) - exc_base] = red[0];
+    }
+}

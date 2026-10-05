@@ -1,6 +1,10 @@
 #include "common.cuh"
 #include "cp-async.cuh"
 #include "mach1.cuh"
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+#include "mach1-rt-had.cuh"
 #include "getrows.cuh"
 #include "mmvf.cuh"
 #include "mmvq.cuh"
@@ -40,6 +44,18 @@ static int mach1_env_int(const char * name, const int def) {
     return s != nullptr ? atoi(s) : def;
 }
 
+static int mach1_rt_radix(const int64_t d) {
+    if ((d & (d - 1)) == 0) {
+        return 1;
+    }
+    const int64_t q = d/12;
+    return d % 12 == 0 && (q & (q - 1)) == 0 ? 12 : 20;
+}
+
+static bool mach1_rt_pow2(const ggml_tensor * rt) {
+    return mach1_rt_radix(rt->src[1]->ne[0]) == 1 && mach1_rt_radix(rt->src[2]->ne[0]) == 1;
+}
+
 // Kernel pointer parameters use plain __restrict__, NOT GGML_CUDA_RESTRICT.
 // That macro is __CUDA_ARCH__-dependent (empty under PDL on Hopper, see
 // llama.cpp#24030), and __CUDA_ARCH__ is defined only in the device pass — so in
@@ -68,6 +84,11 @@ static void mach1_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & p
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename Kernel, typename... Args>
+static void mach1_launch_pdl(Kernel kernel, const ggml_cuda_kernel_launch_params & p, Args &&... args) {
+    mach1_launch_pdl_raw(kernel, p.block_nums, p.block_dims, p.shmem, p.stream, std::forward<Args>(args)...);
+}
+
 // --- measurement-only instrumentation (default off, no numeric effect) ---
 // GGML_MACH1_TIME=1: wall-clock every mach1 kernel launch (stream sync before
 // and after) keyed by stage + shape; totals dump to stderr at process exit.
@@ -75,6 +96,7 @@ static void mach1_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & p
 // GGML_MACH1_DEBUG=1: one-time diagnostics (p4 repack status).
 #include <chrono>
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <set>
 #include <string>
@@ -211,6 +233,88 @@ static int mach1_pp_min() {
     static const int v = mach1_pplow_on()
         ? std::max(64, mach1_env_int("GGML_MACH1_PPLOW_MIN", 128)) : 256;
     return v;
+}
+
+static int mach1_hadr_wide_max() {
+    static const int v = mach1_env_int("GGML_MACH1_HADR_WIDE", 8);
+    return v;
+}
+
+static int mach1_hadr_wg() {
+    static const int v = mach1_env_int("GGML_MACH1_HADR_WG", 1024) >= 1024 ? 1024 : 512;
+    return v;
+}
+
+static bool mach1_hadr_warp_ok(int d, int r, int nt) {
+    static const bool on = mach1_env_int("GGML_MACH1_HADR_WARP", 1) != 0;
+    const int M = d / r;
+    return on && M >= 32 && M <= 1024 && nt <= mach1_hadr_wide_max();
+}
+
+static bool mach1_hadr_tl_on() {
+    static const bool tl = mach1_env_int("GGML_MACH1_HADR_TL", 1) != 0;
+    return tl;
+}
+
+static bool mach1_hadr_v4_on() {
+    static const bool v4 = mach1_env_int("GGML_MACH1_HADR_V4", 1) != 0;
+    return v4;
+}
+
+static bool mach1_hadr_warp_launch(bool out, const float * a, const float * b, float * dst, int d, int r,
+                                   int nt, int nsplit, int64_t sstride, cudaStream_t stream,
+                                   const mach1_hadr_xops * xo = nullptr, int nops = 1, const int * perm = nullptr,
+                                   const float * gs = nullptr, const float * go = nullptr) {
+    if (!mach1_hadr_warp_ok(d, r, nt) || (perm != nullptr && (!out || nt != 1 || !mach1_hadr_tl_on())) ||
+        (gs != nullptr && (out || nt != 1 || nops != 1 || !mach1_hadr_tl_on()))) {
+        return false;
+    }
+    if (mach1_skip(out ? 2 : 1)) {
+        return true;
+    }
+    const int M = d / r;
+    int dmax = d;
+    for (int k = 0; k + 1 < nops; ++k) {
+        GGML_ASSERT(xo->d[k] / xo->r[k] == M && nsplit == 1);
+        dmax = std::max(dmax, xo->d[k]);
+    }
+    const mach1_hadr_xops xz = xo != nullptr ? *xo : mach1_hadr_xops {};
+    static const int split = std::max(1, mach1_env_int("GGML_MACH1_HADR_SPLIT", 8));
+    static const int minm  = mach1_env_int("GGML_MACH1_HADR_SPLIT_MINM", 128);
+    int S = M >= minm ? split : 1;
+    while (S > 1 && (S > 32 || 32 % S != 0)) {
+        --S;
+    }
+    const auto params = ggml_cuda_kernel_launch_params(dim3(nt, S, nops), dim3(1024, 1, 1), (size_t) (dmax/S)*sizeof(float), stream);
+    const bool tl = mach1_hadr_tl_on();
+    const int * np = nullptr;
+    const auto al16 = [](const float * p) { return ((uintptr_t) p & 15) == 0; };
+    bool v4 = tl && (M/32) % 4 == 0 && mach1_hadr_v4_on() && al16(a) && al16(b) && al16(gs) && al16(go) &&
+              (nsplit <= 1 || sstride % 4 == 0);
+    for (int k = 0; k + 1 < nops; ++k) {
+        v4 = v4 && al16(xo->a[k]) && al16(xo->b[k]);
+    }
+#define M1_QW2(E, V) \
+    if (gs != nullptr) { \
+        mach1_launch_pdl(mach1_hadr_gated_in_kernel<E, V>, params, a, gs, go, dst, d, r); \
+    } else if (tl) { \
+        if (out) { mach1_launch_pdl(mach1_rt_hadr_warp_kernel<1024, E, true,  true, V>, params, a, b, dst, d, r, nsplit, sstride, xz, perm); } \
+        else     { mach1_launch_pdl(mach1_rt_hadr_warp_kernel<1024, E, false, true, V>, params, a, b, dst, d, r, 1, (int64_t) 0, xz, np); } \
+    } else if (out) { mach1_launch_pdl(mach1_rt_hadr_warp_kernel<1024, E, true>,  params, a, b, dst, d, r, nsplit, sstride, xz, np); } \
+    else            { mach1_launch_pdl(mach1_rt_hadr_warp_kernel<1024, E, false>, params, a, b, dst, d, r, 1, (int64_t) 0, xz, np); }
+#define M1_QW(E) \
+    if (v4) { M1_QW2(E, (E) % 4 == 0) } else { M1_QW2(E, false) }
+    switch (M/32) {
+        case 1:  M1_QW(1);  break;
+        case 2:  M1_QW(2);  break;
+        case 4:  M1_QW(4);  break;
+        case 8:  M1_QW(8);  break;
+        case 16: M1_QW(16); break;
+        default: M1_QW(32); break;
+    }
+#undef M1_QW
+#undef M1_QW2
+    return true;
 }
 
 // GGML_MACH1_PPLOW_GG_MIN: the grouped-GEMM lane's own floor. GG fetches the
@@ -803,14 +907,32 @@ static void mach1_smem_opt_in(const void * fn, const size_t smem) {
     if (smem <= 24*1024) {
         return;
     }
-    static std::map<const void *, size_t> done;
+    static std::map<std::pair<int, const void *>, size_t> done;
     static std::mutex mtx;
     std::lock_guard<std::mutex> lock(mtx);
-    size_t & cur = done[fn];
+    size_t & cur = done[{ggml_cuda_get_device(), fn}];
     if (smem > cur) {
         CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         cur = smem;
     }
+}
+
+static cublasHandle_t mach1_cublas(int site, int64_t key) {
+    static std::map<std::tuple<int, int, int64_t>, cublasHandle_t> handles;
+    static void * ws[GGML_CUDA_MAX_DEVICES] = {nullptr};
+    static std::mutex mtx;
+    static const size_t wssz = 32u*1024u*1024u;
+    const int device = ggml_cuda_get_device();
+    std::lock_guard<std::mutex> lk(mtx);
+    cublasHandle_t & h = handles[{device, site, key}];
+    if (h == nullptr) {
+        CUBLAS_CHECK(cublasCreate(&h));
+        if (ws[device] == nullptr) {
+            CUDA_CHECK(cudaMalloc(&ws[device], wssz));
+        }
+        CUBLAS_CHECK(cublasSetWorkspace(h, ws[device], wssz));
+    }
+    return h;
 }
 
 // +-1 Sylvester H tiles (16/32/64/128) as fp16 on device, one buffer per GPU
@@ -2320,23 +2442,7 @@ void ggml_cuda_op_mach1_head_mm(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     (const float *) x->data, hx16, total);
             });
             mach1_timed(hstream, std::string("head_bank_gemm") + shp, [&]() {
-                static std::map<int64_t, cublasHandle_t> hbmap;
-                static std::mutex hbmu;
-                cublasHandle_t cbh;
-                {
-                    std::lock_guard<std::mutex> lk(hbmu);
-                    auto & hh = hbmap[((int64_t) vocab << 20) | (int64_t) nt];
-                    if (hh == nullptr) {
-                        CUBLAS_CHECK(cublasCreate(&hh));
-                        static void * hws = nullptr;
-                        static const size_t hwssz = 32u*1024u*1024u;
-                        if (hws == nullptr) {
-                            CUDA_CHECK(cudaMalloc(&hws, hwssz));
-                        }
-                        CUBLAS_CHECK(cublasSetWorkspace(hh, hws, hwssz));
-                    }
-                    cbh = hh;
-                }
+                const cublasHandle_t cbh = mach1_cublas(1, ((int64_t) vocab << 20) | (int64_t) nt);
                 CUBLAS_CHECK(cublasSetStream(cbh, hstream));
                 const float onef = 1.0f, zerof = 0.0f;
                 CUBLAS_CHECK(cublasGemmEx(cbh, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -3631,15 +3737,30 @@ static void mach1_rt_spine_imma8_p16(
 // batch kernel - 4 plus the TC fold workspace exceeds Ada's 99 KB block
 // budget - and 4 where the shared budget is free.
 template <int REP>
+static __device__ __forceinline__ uint32_t mach1_zrow_msk(const int sel) {
+    static_assert(REP == 1 || REP == 2 || REP == 4, "row stride REP*4 bytes, REP <= 4");
+    constexpr int LG = REP == 4 ? 2 : REP == 2 ? 1 : 0;
+    return (1023u << (2 + LG)) | ((uint32_t) (sel & (REP - 1)) << 2);
+}
+
+template <int REP>
+static __device__ __forceinline__ uint32_t mach1_zrow_ld(const uint32_t * zslutr, const uint32_t ph,
+        const uint32_t msk) {
+    constexpr int LG = REP == 4 ? 2 : REP == 2 ? 1 : 0;
+    return *(const uint32_t *) ((const char *) zslutr + (((ph >> (4 - LG)) | (4u*(REP - 1))) & msk));
+}
+
+template <int REP>
 static __device__ __forceinline__ int mach1_rt_zdp_row_rep(
         const uint32_t * __restrict__ ph,
         const uint32_t *              zslutr,   // [1024*REP]
         const uint32_t * __restrict__ qq, const int sel) {
+    const uint32_t msk = mach1_zrow_msk<REP>(sel);
     int iacc = 0;
 #pragma unroll
     for (int j = 0; j < 8; j += 2) {
-        const uint32_t z01 = zslutr[((ph[j]     >> 6) & 1023u)*REP + sel];
-        const uint32_t z23 = zslutr[((ph[j + 1] >> 6) & 1023u)*REP + sel];
+        const uint32_t z01 = mach1_zrow_ld<REP>(zslutr, ph[j],     msk);
+        const uint32_t z23 = mach1_zrow_ld<REP>(zslutr, ph[j + 1], msk);
         iacc = ggml_cuda_dp4a((int) __byte_perm(z01, z23, 0x5410), (int) qq[j >> 1], iacc);
     }
     return iacc;
@@ -3755,105 +3876,6 @@ static __device__ void mach1_fwht_chunked(
             v[c0 + i] = sh[i];
         }
         __syncthreads();
-    }
-}
-
-// WG covers one thread per column tile (tid < tiles_y walk); WG=128 avoids
-// launching idle warps when tiles_y <= 128 (n <= 2048). The dropped warps
-// only ever contributed exact zeros to the cross-warp reduction.
-template <int WG>
-__global__ void mach1_rt_walk_kernel(
-        const uint16_t * __restrict__ trellis,
-        const half     * __restrict__ tlut,     // pre-rounded fp16
-        const float    * __restrict__ scr_u,
-        float          * __restrict__ scr_v,
-        const int m, const int n) {
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int n_warps   = WG / warp_size;
-    __shared__ float red[16][8];   // >= n_warps for warp_size 32 (and 64 on HIP)
-    __shared__ float slut[1024];   // full F16 [2,512] tlut, staged as fp32
-
-    const int t   = blockIdx.z;
-    const int tr  = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    constexpr int words = 64;      // K = 4: 64 int16 words per 16x16 tile
-    const int tiles_y = n / 16;
-    const bool have   = tid < tiles_y;
-
-    // 2 KB table: gather from shared instead of global (same fp32 values —
-    // the __half2float just moves ahead of the gather)
-    for (int i = tid; i < 1024; i += WG) {
-        slut[i] = __half2float(tlut[i]);
-    }
-    __syncthreads();
-
-    float partial[16];
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        partial[i] = 0.0f;
-    }
-
-    if (have) {
-        const int64_t tw = ((int64_t) tr*tiles_y + tid)*words;
-        const float * ub = scr_u + (int64_t) t*n + tid*16;
-
-        // the tile column's 16 u values are shared by all 16 tile rows
-        float uu[16];
-#pragma unroll
-        for (int c = 0; c < 16; ++c) {
-            uu[c] = ub[c];
-        }
-
-        for (int ri = 0; ri < 16; ++ri) {
-            // row ri covers stream bytes [8*ri, 8*ri+8] -> words [4*ri, 4*ri+4]
-            uint32_t w[5];
-#pragma unroll
-            for (int q = 0; q < 5; ++q) {
-                w[q] = trellis[tw + ((4*ri + q) & 63)];   // only q=4,ri=15 wraps
-            }
-            // 8 independent byte-aligned direct-window states
-            uint32_t ph[8];
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const uint32_t hi = w[j >> 1];
-                const uint32_t st = (j & 1) == 0 ? hi
-                    : (((hi << 8) | (w[(j >> 1) + 1] >> 8)) & 0xFFFFu);
-                ph[j] = st*(st + 1u);
-            }
-            // same accumulation order as the serial walk: per state, w0 then w1
-            float acc = 0.0f;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const uint32_t row = (ph[j] >> 6) & 511u;
-                float a0 = slut[2*row + 0];
-                const float a1 = slut[2*row + 1];
-                if (ph[j] & 0x8000u) {
-                    a0 = -a0;                             // exact in fp16 (sign bit)
-                }
-                acc += a0*uu[2*j] + a1*uu[2*j + 1];
-            }
-            partial[ri] = acc;
-        }
-    }
-
-    const int lane = tid % warp_size;
-    const int wid  = tid / warp_size;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        const float s = warp_reduce_sum<warp_size>(partial[i]);
-        if (lane == 0) {
-            red[i][wid] = s;
-        }
-    }
-    __syncthreads();
-    if (tid < 16) {
-        float sum = 0.0f;
-#pragma unroll
-        for (int wj = 0; wj < n_warps; ++wj) {
-            sum += red[tid][wj];
-        }
-        scr_v[(int64_t) t*m + tr*16 + tid] = sum;
     }
 }
 
@@ -4085,8 +4107,48 @@ static int mach1_lutx() {
 //
 // The sign is the same trick: bit 15 of the packed word IS the sign bit of
 // the low half, so XOR-ing it with the phase bit replaces the branch.
-template <int WG, int RG, int UFUSE, int OFUSE = 0, int TCF = 0, int LUTX = 0, int ZDP = 0>
-__global__ void __launch_bounds__(WG) mach1_rt_walk_rows_v_kernel(
+template <int WG>
+static __device__ __forceinline__ void mach1_rt_stage_tiles(uint4 * strel, const uint16_t * trellis,
+        const int tr, const int tiles_y, const int c0, const int nct, const int tid) {
+    const uint4 * src = (const uint4 *) (trellis + ((int64_t) tr*tiles_y + c0)*64);
+    for (int i = tid; i < nct*8; i += WG) {
+        const int tt = i >> 3;
+        uint4 * dst = strel + tt*8 + ((i & 7) ^ (tt & 7));
+#ifdef CP_ASYNC_AVAILABLE
+        cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(dst), src + i);
+#else
+        *dst = src[i];
+#endif
+    }
+}
+
+static __device__ __forceinline__ void mach1_rt_stage_wait() {
+#ifdef CP_ASYNC_AVAILABLE
+    cp_async_wait_all();
+#endif
+}
+
+static int mach1_walk_pdb(const int device) {
+    static const int env = mach1_env_int("GGML_MACH1_WALK_PDB", -1);
+    if (env >= 0) {
+        return env;
+    }
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_HOPPER ? 2 : 0;
+}
+
+static int mach1_walk_pdb_grid(const int tiles, const int nyz, const int device) {
+    const int b = mach1_walk_pdb(device);
+    if (b <= 0 || tiles <= 0) {
+        return tiles;
+    }
+    const int cap = std::max(1, b*ggml_cuda_info().devices[device].nsm/std::max(1, nyz));
+    const int rpb = (tiles + cap - 1)/cap;
+    return (tiles + rpb - 1)/rpb;
+}
+
+template <int WG, int RG, int UFUSE, int OFUSE = 0, int TCF = 0, int LUTX = 0, int ZDP = 0, int STG = 0>
+static __device__ __forceinline__ void mach1_rt_walk_rows_v_body(
         const uint16_t * __restrict__ trellis,
         const half     * __restrict__ tlut,     // pre-rounded fp16
         const float    * __restrict__ scr_u,    // UFUSE = 0
@@ -4101,24 +4163,36 @@ __global__ void __launch_bounds__(WG) mach1_rt_walk_rows_v_kernel(
         const half     * __restrict__ htab,     // TCF = 1
         const uint16_t * __restrict__ ztab,     // ZDP = 1
         const float zs0,                        // ZDP = 1
-        const int      * __restrict__ xperm) {  // XPERM: gather x through a row map (or nullptr)
+        const int      * __restrict__ xperm,
+        const int tr0, const int trs) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int CT        = WG / RG;
     constexpr int n_warps   = CT / warp_size;
     constexpr int ROWS      = 16 / RG;
+    static_assert(!STG || (OFUSE == 0 && TCF == 0), "STG stages the trellis in the dynamic buffer");
     __shared__ float red[RG][16/RG][CT/32];
+    __shared__ uint4 szq[(STG && ZDP) ? CT : 1];
+    __shared__ float szf[(STG && ZDP) ? CT : 1];
     __shared__ float slutA[(LUTX || ZDP) ? 1 : 512];
     __shared__ float slutB[(LUTX || ZDP) ? 1 : 512];
     __shared__ uint32_t slutX[LUTX ? 512*LUTX : 1];
     __shared__ uint32_t zslutr[ZDP ? 4096 : 1];   // 4-way replicated
-    __shared__ float shu[CT*16];
-    extern __shared__ float obuf[];   // OFUSE: [m]; TCF: the TC workspace
+    __shared__ __align__(16) float shu[CT*16];
+    extern __shared__ float obuf[];
 
+    mach1_pdl_trigger();
     const int t   = blockIdx.z;
-    const int tr  = blockIdx.x;
     const int tid = threadIdx.x;
     const int ct  = tid % CT;
     const int rg  = tid / CT;
+
+    const int tiles_y = n / 16;
+    const int c0      = blockIdx.y*CT;
+    const int nct     = STG ? min(CT, tiles_y - c0) : 0;
+    uint4 * strel = (uint4 *) obuf;
+    if constexpr (STG) {
+        mach1_rt_stage_tiles<WG>(strel, trellis, tr0, tiles_y, c0, nct, tid);
+    }
 
     if (ZDP) {
         for (int i = tid; i < 1024; i += WG) {
@@ -4143,9 +4217,26 @@ __global__ void __launch_bounds__(WG) mach1_rt_walk_rows_v_kernel(
             slutB[i] = __half2float(tlut[2*i + 1]);
         }
     }
-    if (UFUSE && TCF) {
+    mach1_pdl_wait();
+    scr_u   = mach1_pdl_dep(scr_u);
+    x       = mach1_pdl_dep(x);
+    scr_v   = mach1_pdl_dep(scr_v);
+    dst     = mach1_pdl_dep(dst);
+    counter = mach1_pdl_dep(counter);
+    if constexpr (UFUSE && TCF) {
         mach1_tc_fwht_dyn<WG, false>(n, x + (int64_t) t*n, su, shu, nullptr, nullptr,
                                      htab, (half *) obuf, tid);
+    } else if (UFUSE && (n & (n - 1)) != 0) {
+        const int rq = (n % 12 == 0 && ((n/12) & (n/12 - 1)) == 0) ? 12 : 20;
+        if (mach1_hadr_u_warp_ok(n, rq, WG)) {
+            mach1_hadr_u_warp_shared<WG>(su, x + (int64_t) t*n, shu, n, rq, tid);
+        } else {
+            for (int i = tid; i < n; i += WG) {
+                shu[i] = su[i] * x[(int64_t) t*n + i];
+            }
+            __syncthreads();
+            mach1_hadr_block<WG, true>(shu, n, rq, tid);
+        }
     } else if (UFUSE) {
         // exactly mach1_rt_u_kernel's body, into shared instead of scr_u.
         // XPERM: the row map moves the load's ADDRESS only - the values are
@@ -4160,40 +4251,102 @@ __global__ void __launch_bounds__(WG) mach1_rt_walk_rows_v_kernel(
             shu[i] = __fdiv_rn(shu[i], sc);
         }
     } else {
-        for (int i = tid; i < n; i += WG) {
-            shu[i] = scr_u[(int64_t) t*n + i];
+        const int s0 = blockIdx.y*CT*16;
+        const float * us = scr_u + (int64_t) t*n + s0;
+        if (STG && (((uintptr_t) us) & 15) == 0) {
+            const int nu4 = min(n - s0, CT*16)/4;
+            constexpr int F4 = (CT*4 + WG - 1)/WG;
+            float4 ur[F4];
+#pragma unroll
+            for (int k = 0; k < F4; ++k) {
+                if (tid + k*WG < nu4) {
+                    ur[k] = ((const float4 *) us)[tid + k*WG];
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < F4; ++k) {
+                if (tid + k*WG < nu4) {
+                    ((float4 *) shu)[tid + k*WG] = ur[k];
+                }
+            }
+        } else {
+            for (int i = tid; i < min(n - s0, CT*16); i += WG) {
+                shu[i] = scr_u[(int64_t) t*n + s0 + i];
+            }
         }
     }
+    if constexpr (STG) {
+        mach1_rt_stage_wait();
+    }
     __syncthreads();
+    if constexpr (STG && ZDP) {
+        if (tid < nct) {
+            float uu[16];
+#pragma unroll
+            for (int c = 0; c < 16; ++c) {
+                uu[c] = shu[tid*16 + c];
+            }
+            uint32_t qq[4];
+            szf[tid] = zs0*mach1_rt_zdp_quant(uu, qq)*(1.0f/127.0f);
+            szq[tid] = make_uint4(qq[0], qq[1], qq[2], qq[3]);
+        }
+        __syncthreads();
+    }
 
-    const int  tiles_y = n / 16;
-    const bool have    = ct < tiles_y;
-
+    int sb = 0;
+    for (int tr = tr0; tr < m/16; tr += trs) {
+    if constexpr (STG == 2) {
+        if (tr + trs < m/16) {
+            mach1_rt_stage_tiles<WG>(strel + (sb ^ 1)*CT*8, trellis, tr + trs, tiles_y, c0, nct, tid);
+        }
+    } else if constexpr (STG) {
+        if (tr != tr0) {
+            mach1_rt_stage_tiles<WG>(strel, trellis, tr, tiles_y, c0, nct, tid);
+            mach1_rt_stage_wait();
+            __syncthreads();
+        }
+    }
+    const uint4 * strc = strel + sb*CT*8;
     float partial[ROWS];
 #pragma unroll
     for (int i = 0; i < ROWS; ++i) {
         partial[i] = 0.0f;
     }
 
-    if (have) {
-        const float * ub = shu + ct*16;
+    const int tc_end = STG ? min(tiles_y, c0 + CT) : tiles_y;
+    for (int tc = c0 + ct; tc < tc_end; tc += gridDim.y*CT) {
+        const bool    first = tc == c0 + ct;
+        const float * ub    = tc < c0 + CT ? shu + (tc - c0)*16 : scr_u + (int64_t) t*n + tc*16;
         float uu[16];
+        if constexpr (!(STG && ZDP)) {
 #pragma unroll
-        for (int c = 0; c < 16; ++c) {
-            uu[c] = ub[c];
+            for (int c = 0; c < 16; ++c) {
+                uu[c] = ub[c];
+            }
         }
         uint32_t qq[4];
         float    fsc = 0.0f;
-        if (ZDP) {
+        if constexpr (STG && ZDP) {
+            const uint4 q4 = szq[ct];
+            qq[0] = q4.x; qq[1] = q4.y; qq[2] = q4.z; qq[3] = q4.w;
+            fsc = szf[ct];
+        } else if (ZDP) {
             fsc = zs0*mach1_rt_zdp_quant(uu, qq)*(1.0f/127.0f);
         }
         // 3 x 128-bit covers words [16rg, 16rg+24), and (2rg+q) & 7 wraps to
         // the tile's word 0 exactly where the scalar form's & 63 does.
-        const uint4 * base = (const uint4 *) (trellis + ((int64_t) tr*tiles_y + ct)*64);
         uint4 v[3];
+        if constexpr (STG) {
 #pragma unroll
-        for (int q = 0; q < 3; ++q) {
-            v[q] = base[(2*rg + q) & 7];
+            for (int q = 0; q < 3; ++q) {
+                v[q] = strc[ct*8 + (((2*rg + q) & 7) ^ (ct & 7))];
+            }
+        } else {
+            const uint4 * base = (const uint4 *) (trellis + ((int64_t) tr*tiles_y + tc)*64);
+#pragma unroll
+            for (int q = 0; q < 3; ++q) {
+                v[q] = base[(2*rg + q) & 7];
+            }
         }
         const uint32_t * V = (const uint32_t *) v;
 #pragma unroll
@@ -4230,7 +4383,8 @@ __global__ void __launch_bounds__(WG) mach1_rt_walk_rows_v_kernel(
                 ph[j] = st[j]*(st[j] + 1u);
             }
             if (ZDP) {
-                partial[r] = (float) mach1_rt_zdp_row_rep<4>(ph, zslutr, qq, ct & 3)*fsc;
+                const float zp = (float) mach1_rt_zdp_row_rep<4>(ph, zslutr, qq, ct & 3)*fsc;
+                partial[r] = first ? zp : partial[r] + zp;
             } else if (LUTX) {
                 constexpr int REP = LUTX ? LUTX : 1;
                 const int     sel = ct & (REP - 1);
@@ -4244,7 +4398,7 @@ __global__ void __launch_bounds__(WG) mach1_rt_walk_rows_v_kernel(
                     const float2   a = __half22float2(*(const half2 *) &w);
                     acc += a.x*uu[2*j] + a.y*uu[2*j + 1];
                 }
-                partial[r] = acc;
+                partial[r] = first ? acc : partial[r] + acc;
             } else {
                 float acc = 0.0f;
 #pragma unroll
@@ -4257,7 +4411,7 @@ __global__ void __launch_bounds__(WG) mach1_rt_walk_rows_v_kernel(
                     }
                     acc += a0*uu[2*j] + a1*uu[2*j + 1];
                 }
-                partial[r] = acc;
+                partial[r] = first ? acc : partial[r] + acc;
             }
         }
     }
@@ -4280,7 +4434,15 @@ __global__ void __launch_bounds__(WG) mach1_rt_walk_rows_v_kernel(
         for (int wj = 0; wj < n_warps; ++wj) {
             sum += red[g][r][wj];
         }
-        scr_v[(int64_t) t*m + tr*16 + g*ROWS + r] = sum;
+        scr_v[((int64_t) blockIdx.y*gridDim.z + t)*m + tr*16 + g*ROWS + r] = sum;
+    }
+    if (tr + trs < m/16) {
+        if constexpr (STG == 2) {
+            mach1_rt_stage_wait();
+            sb ^= 1;
+        }
+        __syncthreads();
+    }
     }
 
     // OFUSE: the last block to publish its tile row runs the out stage
@@ -4327,6 +4489,47 @@ __global__ void __launch_bounds__(WG) mach1_rt_walk_rows_v_kernel(
     } else {
         (void) sv; (void) dst; (void) counter; (void) operm; (void) htab;
     }
+}
+
+template <int WG, int RG, int UFUSE, int OFUSE = 0, int TCF = 0, int LUTX = 0, int ZDP = 0, int STG = 0,
+          int MINB = (WG == 640 ? 2 : 1)>
+__global__ void __launch_bounds__(WG, MINB) mach1_rt_walk_rows_v_kernel(
+        const uint16_t * __restrict__ trellis,
+        const half     * __restrict__ tlut,
+        const float    * __restrict__ scr_u,
+        const float    * __restrict__ su,
+        const float    * __restrict__ x,
+        float          * __restrict__ scr_v,
+        const int m, const int n,
+        const float    * __restrict__ sv,
+        float          * __restrict__ dst,
+        int            * __restrict__ counter,
+        const int      * __restrict__ operm,
+        const half     * __restrict__ htab,
+        const uint16_t * __restrict__ ztab,
+        const float zs0,
+        const int      * __restrict__ xperm) {
+    mach1_rt_walk_rows_v_body<WG, RG, UFUSE, OFUSE, TCF, LUTX, ZDP, STG>(trellis, tlut, scr_u, su, x, scr_v, m, n,
+        sv, dst, counter, operm, htab, ztab, zs0, xperm, (int) blockIdx.x, (int) gridDim.x);
+}
+
+struct mach1_rt_walk_mops {
+    const uint16_t * trellis[3];
+    const float    * scr_u[3];
+    float          * scr_v[3];
+    int              m[3];
+    int              b[3];
+};
+
+template <int WG, int ZDP, int STG = 0>
+__global__ void __launch_bounds__(WG, WG == 640 ? 2 : 1) mach1_rt_walk_rows_v_multi_kernel(
+        const mach1_rt_walk_mops ops, const half * __restrict__ tlut, const int n,
+        const uint16_t * __restrict__ ztab, const float zs0) {
+    const int bx = blockIdx.x;
+    const int k  = bx >= ops.b[2] ? 2 : (bx >= ops.b[1] ? 1 : 0);
+    mach1_rt_walk_rows_v_body<WG, 4, 0, 0, 0, 0, ZDP, STG>(ops.trellis[k], tlut, ops.scr_u[k], nullptr, nullptr,
+        ops.scr_v[k], ops.m[k], n, nullptr, nullptr, nullptr, nullptr, nullptr, ztab, zs0, nullptr,
+        bx - ops.b[k], 1 << 30);
 }
 
 // TT-token walk (GGML_MACH1_WALK_TT, nt >= 2): decode once, MAC TT tokens.
@@ -4495,13 +4698,13 @@ static __device__ __forceinline__ void mach1_rt_walk_tt_body(
             st[4] = B;   st[5] = __funnelshift_l(B,  B,  8);
             st[6] = Bp;  st[7] = __funnelshift_l(Bp, Bp, 8);
             if (ZDP) {
-                const int sel = ct & (REP - 1);
+                const uint32_t msk = mach1_zrow_msk<REP>(ct);
 #pragma unroll
                 for (int j = 0; j < 8; j += 2) {
                     const uint32_t p0  = st[j]*(st[j] + 1u);
                     const uint32_t p1  = st[j + 1]*(st[j + 1] + 1u);
-                    const uint32_t z01 = zslutr[((p0 >> 6) & 1023u)*REP + sel];
-                    const uint32_t z23 = zslutr[((p1 >> 6) & 1023u)*REP + sel];
+                    const uint32_t z01 = mach1_zrow_ld<REP>(zslutr, p0, msk);
+                    const uint32_t z23 = mach1_zrow_ld<REP>(zslutr, p1, msk);
                     wc[r][j >> 1] = __byte_perm(z01, z23, 0x5410);
                 }
             } else {
@@ -5148,23 +5351,7 @@ bool ggml_cuda_mach1_skinny_mm(ggml_backend_cuda_context & ctx,
             (const float *) src1->data, b16, total);
     });
     mach1_timed(stream, "skinny_gemm", [&]() {
-        static std::map<int64_t, cublasHandle_t> hmap;
-        static std::mutex hmu;
-        cublasHandle_t cbh;
-        {
-            std::lock_guard<std::mutex> lk(hmu);
-            auto & hh = hmap[((int64_t) m << 40) | (nt << 20) | k];
-            if (hh == nullptr) {
-                CUBLAS_CHECK(cublasCreate(&hh));
-                static void * ws = nullptr;
-                static const size_t wssz = 32u*1024u*1024u;
-                if (ws == nullptr) {
-                    CUDA_CHECK(cudaMalloc(&ws, wssz));
-                }
-                CUBLAS_CHECK(cublasSetWorkspace(hh, ws, wssz));
-            }
-            cbh = hh;
-        }
+        const cublasHandle_t cbh = mach1_cublas(2, ((int64_t) m << 40) | (nt << 20) | k);
         CUBLAS_CHECK(cublasSetStream(cbh, stream));
         const float onef = 1.0f, zerof = 0.0f;
         CUBLAS_CHECK(cublasGemmEx(cbh, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -5609,13 +5796,13 @@ static void mach1_zbank_mmvq(ggml_backend_cuda_context & ctx, const void * W,
     src0.type  = GGML_TYPE_Q8_0;
     src0.ne[0] = cols; src0.ne[1] = rows; src0.ne[2] = 1; src0.ne[3] = 1;
     src0.nb[0] = ts;   src0.nb[1] = row;  src0.nb[2] = row*rows; src0.nb[3] = src0.nb[2];
-    src0.data  = (void *) W;
+    src0.data  = const_cast<void *>(static_cast<const void *>(W));
 
     ggml_tensor src1 = {};
     src1.type  = GGML_TYPE_F32;
     src1.ne[0] = cols; src1.ne[1] = 1;      src1.ne[2] = 1; src1.ne[3] = 1;
     src1.nb[0] = 4;    src1.nb[1] = 4*cols; src1.nb[2] = src1.nb[1]; src1.nb[3] = src1.nb[1];
-    src1.data  = (void *) y;
+    src1.data  = const_cast<void *>(static_cast<const void *>(y));
 
     ggml_tensor dst = {};
     dst.type  = GGML_TYPE_F32;
@@ -5639,13 +5826,13 @@ static void mach1_fold_mmvf(ggml_backend_cuda_context & ctx, const half * W,
     src0.type  = GGML_TYPE_F16;
     src0.ne[0] = cols; src0.ne[1] = rows;       src0.ne[2] = 1; src0.ne[3] = 1;
     src0.nb[0] = 2;    src0.nb[1] = 2*cols;     src0.nb[2] = 2*cols*rows; src0.nb[3] = src0.nb[2];
-    src0.data  = (void *) W;
+    src0.data  = const_cast<void *>(static_cast<const void *>(W));
 
     ggml_tensor src1 = {};
     src1.type  = GGML_TYPE_F32;
     src1.ne[0] = cols; src1.ne[1] = 1;          src1.ne[2] = 1; src1.ne[3] = 1;
     src1.nb[0] = 4;    src1.nb[1] = 4*cols;     src1.nb[2] = src1.nb[1]; src1.nb[3] = src1.nb[1];
-    src1.data  = (void *) y;
+    src1.data  = const_cast<void *>(static_cast<const void *>(y));
 
     ggml_tensor dst = {};
     dst.type  = GGML_TYPE_F32;
@@ -5919,6 +6106,10 @@ __global__ void mach1_rt_out_kernel(
         float       * __restrict__ dst,
         const int m) {
     __shared__ float sh[8192];
+    mach1_pdl_trigger();
+    mach1_pdl_wait();
+    scr_v = mach1_pdl_dep(scr_v);
+    dst   = mach1_pdl_dep(dst);
 
     const int t   = blockIdx.x;
     const int tid = threadIdx.x;
@@ -5936,7 +6127,7 @@ __global__ void mach1_rt_out_kernel(
 
 void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                               const void * x_data_override, const int * xperm,
-                              const mach1_rt_tail * tail) {
+                              const mach1_rt_tail * tail, const float * su_ready) {
     const ggml_tensor * trellis = dst->src[0];
     const ggml_tensor * su      = dst->src[1];
     const ggml_tensor * sv      = dst->src[2];
@@ -5964,8 +6155,13 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int n  = (int) su->ne[0];
     const int m  = (int) sv->ne[0];
     const int nt = (int)(x->ne[1]*x->ne[2]*x->ne[3]);
-    GGML_ASSERT(n <= 4096);   // rt_u shared bound
-    GGML_ASSERT(m <= 8192);   // rt_out shared bound
+    const int  rn   = mach1_rt_radix(n);
+    const int  rm   = mach1_rt_radix(m);
+    const bool hadr = rn != 1 || rm != 1;
+    GGML_ASSERT(n <= (rn == 1 ? 4096 : MACH1_RT_HADR_MAX));
+    GGML_ASSERT(m <= (rm == 1 ? 8192 : MACH1_RT_HADR_MAX));
+    GGML_ASSERT(!hadr || (x_data_override == nullptr && xperm == nullptr && tail == nullptr));
+    GGML_ASSERT(su_ready == nullptr || (rn != 1 && nt == 1));
 
     // KS4 needs four logical partial rows per token. Co-allocate them with the
     // existing scr_v row so the core carries one 64-bit destination base just
@@ -5993,11 +6189,15 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool rt_mma16_shape = (n == 2048 && (m == 4096 || m == 8192)) ||
                                 (rt_mma16_m2_on && m == 2048 &&
                                  (n == 512 || n == 2048 || n == 4096));
-    const size_t scr_v_rows = split4_storage ? (size_t) 4*nt : (size_t) nt;
+    static const bool wsplit_on = mach1_env_int("GGML_MACH1_WALK_SPLIT", 1) != 0;
+    const int vsplit_max = (wsplit_on && nt == 1 && rm != 1 && n % 16 == 0 && n/16 > 256)
+                           ? (n/16 + 127)/128 : 1;
+    int vsplit = 1;
+    const size_t scr_v_rows = split4_storage ? (size_t) 4*nt : (size_t) vsplit_max*nt;
     ggml_cuda_pool_alloc<float> scr(
         ctx.pool(), (size_t) nt*n + scr_v_rows*m);
-    float * scr_u = scr.get();
-    float * scr_v = scr_u + (size_t) nt*n;
+    float * scr_u = su_ready != nullptr ? const_cast<float *>(su_ready) : scr.get();
+    float * scr_v = scr.get() + (size_t) nt*n;
 
     cudaStream_t stream = ctx.stream();
 
@@ -6015,7 +6215,7 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // GGML_MACH1_FOLD=1 (UNCERTIFIED): serve decode from a W_eff bank - one
     // fp16 GEMV per op. Prefill keeps the exact paths; a fold-on process never
     // touches the plain banks (same cache key, different contents).
-    if (mach1_fold_enabled() && nt == 1) {
+    if (mach1_fold_enabled() && nt == 1 && !hadr) {
         const bool foldq = mach1_foldq_enabled();
         // FOLDQ stores Q8_0 blocks in place of fp16 halves: 1.0625 B/weight.
         // The cache is half-typed, so ask for bytes/2 (block size is even).
@@ -6087,7 +6287,7 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // (GGML_MACH1_FUSE_RT=1) since the shape is right for small-m ops.
     static const bool fuse_on = mach1_env_int("GGML_MACH1_FUSE_RT", 0) != 0 &&
                                 mach1_env_int("GGML_MACH1_ABLATE", 0) == 0;
-    if (fuse_on && nt == 1 && !mach1_fold_enabled()) {
+    if (fuse_on && nt == 1 && !mach1_fold_enabled() && !hadr) {
         int * counter = mach1_fused_counter(ctx.device, stream);
         if (counter != nullptr) {
             half * fbank = mach1_bank_get(trellis->data, (size_t) m*n, ctx.device, stream, decode_bank);
@@ -6127,7 +6327,7 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     // GGML_MACH1_COOP=1: one cooperative launch replaces rt_u + walk + rt_out
-    if (mach1_env_int("GGML_MACH1_COOP", 0) != 0 && nt == 1 &&
+    if (mach1_env_int("GGML_MACH1_COOP", 0) != 0 && nt == 1 && !hadr &&
         n % 16 == 0 && n/16 <= 256 && mach1_env_int("GGML_MACH1_ABLATE", 0) == 0 &&
         !mach1_fold_enabled() && !mach1_zbank_enabled()) {
         // CT must cover tiles_y: WG 512 (CT 128) up to n = 2048, WG 1024
@@ -6180,7 +6380,9 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     static const int  walk_rg0  = mach1_env_int("GGML_MACH1_WALK_RG", 4);
     static const int  probe00   = mach1_env_int("GGML_MACH1_WALK_PROBE", 0);
     static const bool lut1k00   = mach1_env_int("GGML_MACH1_LUT1K", 0) != 0;
-    const bool ufuse = ufuse_maxb > 0 && m/16 <= ufuse_maxb && nt == 1 &&
+    static const bool ufuse_hadr = mach1_env_int("GGML_MACH1_UFUSE_HADR", 0) != 0;
+    const bool ufuse = (!hadr || (ufuse_hadr && xperm == nullptr)) && su_ready == nullptr &&
+                       ufuse_maxb > 0 && m/16 <= ufuse_maxb && nt == 1 &&
                        wvec0 && walk_rg0 == 4 && probe00 == 0 && !lut1k00 &&
                        n % 16 == 0 && n/16 <= 256 &&
                        !mach1_ablate(MACH1_ABLATE_RT_U) &&
@@ -6196,7 +6398,7 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     static const int  walk_tt00   = mach1_env_int("GGML_MACH1_WALK_TT", 16);
     static const int  walk_ttw00  = mach1_env_int("GGML_MACH1_WALK_TTW", 0);
     static const bool walk_ttof00 = mach1_env_int("GGML_MACH1_WALK_TT_OF", 0) != 0;
-    const bool uf_tt = uf_tt_env != 0 && nt >= 2 && walk_tt00 >= 2 && nt <= walk_tt00 &&
+    const bool uf_tt = !hadr && uf_tt_env != 0 && nt >= 2 && walk_tt00 >= 2 && nt <= walk_tt00 &&
                        ufuse_maxb > 0 && m/16 <= ufuse_maxb &&
                        wvec0 && walk_rg0 == 4 && probe00 == 0 && !lut1k00 &&
                        n % 16 == 0 && n/16 <= 256 &&
@@ -6230,7 +6432,7 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // tensor-core Kronecker two-dot. NOT bit-exact (fp16 operands) - certified
     // by the KL gate, so it composes with the bit-exact folds.
     static const int tc_nt = mach1_env_int("GGML_MACH1_TC_NT", 16);
-    const half * tc_htab = nt <= tc_nt ? mach1_tc_fwht_tab(ctx.device, stream) : nullptr;
+    const half * tc_htab = nt <= tc_nt && !hadr ? mach1_tc_fwht_tab(ctx.device, stream) : nullptr;
 
     // Default-off format-aware rung. It reuses the existing ZDP lattice table
     // and scr_u allocation, but changes the transform/spine handoff to q8 K16
@@ -6246,6 +6448,26 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         split4_storage && rt_imma8;
 
     const auto launch_u_stage = [&]() {
+        if (rn != 1) {
+            mach1_timed(stream, std::string("rt_u_hadr") + shp, [&]() {
+            if (mach1_hadr_warp_launch(false, (const float *) su->data, (const float *) x->data, scr_u,
+                                       n, rn, nt, 1, 0, stream)) {
+            } else if (nt <= mach1_hadr_wide_max() && mach1_hadr_wg() == 1024) {
+                mach1_launch(mach1_rt_u_hadr_kernel<1024, true>,
+                    ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(1024, 1, 1), (size_t) n*sizeof(float), stream),
+                    (const float *) su->data, (const float *) x->data, scr_u, n, rn);
+            } else if (nt <= mach1_hadr_wide_max()) {
+                mach1_launch(mach1_rt_u_hadr_kernel<512>,
+                    ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), (size_t) n*sizeof(float), stream),
+                    (const float *) su->data, (const float *) x->data, scr_u, n, rn);
+            } else {
+                mach1_launch(mach1_rt_u_hadr_kernel<256>,
+                    ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), (size_t) n*sizeof(float), stream),
+                    (const float *) su->data, (const float *) x->data, scr_u, n, rn);
+            }
+            });
+            return;
+        }
         if (tc_htab != nullptr && mach1_tc_fwht_dim(n)) {
             mach1_timed(stream, std::string("rt_u_tc") + shp, [&]() {
             mach1_rt_u_tc(tc_htab, (const float *) su->data, (const float *) x->data,
@@ -6287,7 +6509,7 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
         });
     };
-    if (!ufuse && !uf_tt && !mach1_ablate(MACH1_ABLATE_RT_U)) {
+    if (!ufuse && !uf_tt && !mach1_ablate(MACH1_ABLATE_RT_U) && su_ready == nullptr) {
         launch_u_stage();
         // GGML_MACH1_LAUNCH_PROBE: re-issue the u stage. It is a pure function
         // of x and su into scr_u, so the repeat is idempotent and the wall
@@ -6424,7 +6646,7 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // floor the apply is a real GEMM - hand it to the tensor cores
         // (u rounded to fp16, cuBLAS 32F accumulate) instead of the scalar
         // FMA kernel. Prefill only; decode shapes keep the certified path.
-        static const bool apply_tc = mach1_env_int("GGML_MACH1_RT_APPLY_TC", 0) != 0;
+        static const bool apply_tc = mach1_env_int("GGML_MACH1_RT_APPLY_TC", 1) != 0;
         if (apply_tc && nt >= mach1_pp_min() && !mach1_ablate(MACH1_ABLATE_RT_WALK)) {
             mach1_pplow_mark("rt apply tc", nt);
             if (mach1_debug_on()) {
@@ -6461,28 +6683,7 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 // API sum) when the handle's last shape differs - the
                 // same-shape chainbench loop runs at 235 TFLOPS because its
                 // handle stays cached
-                static std::once_flag hb_once;
-                static std::map<std::pair<int,int>, cublasHandle_t> hmap;
-                static std::mutex hmu;
-                cublasHandle_t cbh;
-                {
-                    std::lock_guard<std::mutex> lk(hmu);
-                    auto & hh = hmap[{m, n}];
-                    if (hh == nullptr) {
-                        CUBLAS_CHECK(cublasCreate(&hh));
-                        // explicit workspace so the split-K path never
-                        // allocates per call (one 32 MB scratch shared by
-                        // all handles - every call runs on the same stream)
-                        static void * ws = nullptr;
-                        static const size_t wssz = 32u*1024u*1024u;
-                        if (ws == nullptr) {
-                            CUDA_CHECK(cudaMalloc(&ws, wssz));
-                        }
-                        CUBLAS_CHECK(cublasSetWorkspace(hh, ws, wssz));
-                    }
-                    cbh = hh;
-                }
-                (void) hb_once;
+                const cublasHandle_t cbh = mach1_cublas(3, ((int64_t) m << 32) | (int64_t) n);
                 CUBLAS_CHECK(cublasSetStream(cbh, stream));
                 const float onef = 1.0f, zerof = 0.0f;
                 // single call: the isolated GemmEx probe (`gemm-probe-s1`)
@@ -6535,13 +6736,16 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // vector trellis load + u staged in shared: -40% on the isolated
         // shape census (3.845 -> 2.304 ms/token). See the kernel comment.
         static const bool wvec = mach1_env_int("GGML_MACH1_WALK_VEC", 1) != 0;
+        static const bool wstride = mach1_env_int("GGML_MACH1_WALK_STRIDE", 1) != 0;
         if (wvec && walk_rg == 4 && probe0 == 0 && !lut1k0 && n % 16 == 0 &&
-            tiles_y0 <= 256) {
-            const int wg = tiles_y0 <= 128 ? 512 : 1024;
+            (tiles_y0 <= 256 || (wstride && nt == 1 && !ufuse && tiles_y0 <= 768))) {
+            const int vs = (wstride && tiles_y0 > 256) ? vsplit_max : 1;
+            static const int wg512_max = mach1_env_int("GGML_MACH1_WALK_WG512_MAX", 128);
+            const int wg = (tiles_y0 <= wg512_max || vs > 1) ? 512 : 1024;
             // OFUSE: fold the rt_out stage into the walk's last block
             static const bool ofuse_on = mach1_env_int("GGML_MACH1_OFUSE", 0) != 0;
             int * ocnt = nullptr;
-            if (ofuse_on && nt == 1 && !mach1_ablate(MACH1_ABLATE_RT_OUT)) {
+            if (ofuse_on && nt == 1 && !hadr && !mach1_ablate(MACH1_ABLATE_RT_OUT)) {
                 ocnt = mach1_stream_counter(ctx.device, stream);
             }
             // TCF covers whichever folded stages are active; a shape outside
@@ -6560,7 +6764,9 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                                 ocnt != nullptr ? mach1_tc_ws_bytes(m) : (size_t) 0);
             }
             const ggml_cuda_kernel_launch_params vp =
-                ggml_cuda_kernel_launch_params(dim3(m/16, 1, nt), dim3(wg, 1, 1), smem, stream);
+                ggml_cuda_kernel_launch_params(dim3(m/16, vs, nt), dim3(wg, 1, 1), smem, stream);
+            GGML_ASSERT(vs == 1 || (nt == 1 && rm != 1 && ocnt == nullptr && !ufuse));
+            vsplit = vs;
             const uint16_t * tre_v = (const uint16_t *) trellis->data;
             const half     * tl_v  = (const half     *) tlut->data;
             const float    * su_v  = (const float    *) su->data;
@@ -6586,7 +6792,7 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 // shortens the per-op serial path. Single-chunk grids only
                 // (the completion counter spans the whole grid).
                 static const bool walk_tt_of = mach1_env_int("GGML_MACH1_WALK_TT_OF", 0) != 0;
-                int * tcnt = (walk_tt_of && nt <= ttc && !mach1_ablate(MACH1_ABLATE_RT_OUT))
+                int * tcnt = (walk_tt_of && nt <= ttc && !hadr && !mach1_ablate(MACH1_ABLATE_RT_OUT))
                              ? mach1_stream_counter(ctx.device, stream) : nullptr;
                 const size_t tsmem = tcnt != nullptr ? (size_t) m*sizeof(float) : 0;
                 // WALK_TTW: the wide form for latency-bound small-m shapes -
@@ -6707,14 +6913,59 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 // The plain walk is the one nt == 1 lands on, so it is where
                 // the lane-addressed codebook is selectable.
                 const int lx = mach1_lutx();
+                static const int persist = mach1_env_int("GGML_MACH1_WALK_PERSIST", 0);
+                const int nsm_w = ggml_cuda_info().devices[ctx.device].nsm;
+                auto pgrid = [&](int bps) {
+                    return persist > 0 ? std::min(m/16, persist*bps*nsm_w) : m/16;
+                };
+                ggml_cuda_kernel_launch_params vp_plain = vp;
+                vp_plain.block_nums.x = pgrid(1);
+#define vp vp_plain
 #define M1_VWALK(WGV, UF, LX, ZD) \
-                mach1_launch(mach1_rt_walk_rows_v_kernel<WGV, 4, UF, 0, 0, LX, ZD>, vp, \
+                mach1_launch_pdl(mach1_rt_walk_rows_v_kernel<WGV, 4, UF, 0, 0, LX, ZD>, vp, \
                     tre_v, tl_v, scr_u, su_v, x_v, scr_v, m, n, \
                     (const float *) nullptr, (float *) nullptr, (int *) nullptr, (const int *) nullptr, (const half *) nullptr, \
                     zt.ztab, zt.zstep, xperm)
+                static const bool wstg = mach1_env_int("GGML_MACH1_WALK_STG", 1) != 0;
+                const auto stg_ok = [&](int wgv) {
+                    return wstg && zdp && !ufuse && xperm == nullptr && smem == 0 && tiles_y0 <= vs*(wgv/4);
+                };
+                static const int minb2_env = mach1_env_int("GGML_MACH1_WALK_MINB2", -1);
+                const int  cc_w  = ggml_cuda_info().devices[ctx.device].cc;
+                const bool minb2 = minb2_env >= 0 ? minb2_env != 0 :
+                                   GGML_CUDA_CC_IS_NVIDIA(cc_w) && cc_w >= GGML_CUDA_CC_HOPPER;
+#define M1_VWALK_STG_K(WGV, MB) \
+                do { \
+                    ggml_cuda_kernel_launch_params vps = vp; \
+                    vps.shmem = (size_t) (WGV/4)*128; \
+                    const int gpdb = mach1_walk_pdb_grid(m/16, (int) (vps.block_nums.y*vps.block_nums.z), ctx.device); \
+                    if (gpdb < m/16) { \
+                        vps.block_nums.x = gpdb; \
+                        vps.shmem *= 2; \
+                        mach1_smem_opt_in((const void *) mach1_rt_walk_rows_v_kernel<WGV, 4, 0, 0, 0, 0, 1, 2, MB>, \
+                                          std::max(vps.shmem, (size_t) 32*1024)); \
+                        mach1_launch_pdl(mach1_rt_walk_rows_v_kernel<WGV, 4, 0, 0, 0, 0, 1, 2, MB>, vps, \
+                            tre_v, tl_v, scr_u, su_v, x_v, scr_v, m, n, \
+                            (const float *) nullptr, (float *) nullptr, (int *) nullptr, (const int *) nullptr, (const half *) nullptr, \
+                            zt.ztab, zt.zstep, xperm); \
+                        break; \
+                    } \
+                    mach1_smem_opt_in((const void *) mach1_rt_walk_rows_v_kernel<WGV, 4, 0, 0, 0, 0, 1, 1, MB>, \
+                                      std::max(vps.shmem, (size_t) 32*1024)); \
+                    mach1_launch_pdl(mach1_rt_walk_rows_v_kernel<WGV, 4, 0, 0, 0, 0, 1, 1, MB>, vps, \
+                        tre_v, tl_v, scr_u, su_v, x_v, scr_v, m, n, \
+                        (const float *) nullptr, (float *) nullptr, (int *) nullptr, (const int *) nullptr, (const half *) nullptr, \
+                        zt.ztab, zt.zstep, xperm); \
+                } while (0)
+#define M1_VWALK_STG(WGV) \
+                do { \
+                    if (WGV == 512 && minb2) { M1_VWALK_STG_K(WGV, (WGV == 512 ? 2 : 1)); } \
+                    else                     { M1_VWALK_STG_K(WGV, 1); } \
+                } while (0)
 #define M1_VWALK_LX(WGV, UF) \
                 do { \
-                    if      (zdp)      { M1_VWALK(WGV, UF,  0, 1); } \
+                    if      (zdp && stg_ok(WGV)) { M1_VWALK_STG(WGV); } \
+                    else if (zdp)      { M1_VWALK(WGV, UF,  0, 1); } \
                     else if (lx ==  8) { M1_VWALK(WGV, UF,  8, 0); } \
                     else if (lx ==  4) { M1_VWALK(WGV, UF,  4, 0); } \
                     else if (lx == 16) { M1_VWALK(WGV, UF, 16, 0); } \
@@ -6725,18 +6976,53 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 // limit, and 8 measured identical to 16 (round 209)
 #define M1_VWALK_LX1024(UF) \
                 do { \
-                    if      (zdp)      { M1_VWALK(1024, UF, 0, 1); } \
+                    if      (zdp && stg_ok(1024)) { M1_VWALK_STG(1024); } \
+                    else if (zdp)      { M1_VWALK(1024, UF, 0, 1); } \
                     else if (lx == 4)  { M1_VWALK(1024, UF, 4, 0); } \
                     else if (lx != 0)  { M1_VWALK(1024, UF, 8, 0); } \
                     else               { M1_VWALK(1024, UF, 0, 0); } \
                 } while (0)
-                if      (wg == 512 && ufuse) { M1_VWALK_LX(512,  1); }
+                static const bool wg640_on = mach1_env_int("GGML_MACH1_WALK_WG640", 1) != 0;
+                const bool wg640 = wg640_on && wg == 1024 && !ufuse && vs == 1 && (zdp || lx == 0) &&
+                                   tiles_y0 > 128 && tiles_y0 <= 160;
+                if (wg640) {
+                    const ggml_cuda_kernel_launch_params vp640 =
+                        ggml_cuda_kernel_launch_params(dim3(pgrid(2), 1, nt), dim3(640, 1, 1), smem, stream);
+#define M1_VWALK640(ZD) \
+                    mach1_launch_pdl(mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, ZD>, vp640, \
+                        tre_v, tl_v, scr_u, su_v, x_v, scr_v, m, n, \
+                        (const float *) nullptr, (float *) nullptr, (int *) nullptr, (const int *) nullptr, (const half *) nullptr, \
+                        zt.ztab, zt.zstep, xperm)
+                    const int gpdb = mach1_walk_pdb_grid(m/16, nt, ctx.device);
+                    if (zdp && stg_ok(640) && gpdb < m/16) {
+                        const ggml_cuda_kernel_launch_params vp640d =
+                            ggml_cuda_kernel_launch_params(dim3(gpdb, 1, nt), dim3(640, 1, 1), (size_t) 2*160*128, stream);
+                        mach1_smem_opt_in((const void *) mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 2>, 2*160*128);
+                        mach1_launch_pdl(mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 2>, vp640d,
+                            tre_v, tl_v, scr_u, su_v, x_v, scr_v, m, n,
+                            (const float *) nullptr, (float *) nullptr, (int *) nullptr, (const int *) nullptr, (const half *) nullptr,
+                            zt.ztab, zt.zstep, xperm);
+                    } else if (zdp && stg_ok(640)) {
+                        const ggml_cuda_kernel_launch_params vp640s =
+                            ggml_cuda_kernel_launch_params(dim3(pgrid(2), 1, nt), dim3(640, 1, 1), (size_t) 160*128, stream);
+                        mach1_smem_opt_in((const void *) mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 1>, 32*1024);
+                        mach1_launch_pdl(mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 1>, vp640s,
+                            tre_v, tl_v, scr_u, su_v, x_v, scr_v, m, n,
+                            (const float *) nullptr, (float *) nullptr, (int *) nullptr, (const int *) nullptr, (const half *) nullptr,
+                            zt.ztab, zt.zstep, xperm);
+                    } else if (zdp) { M1_VWALK640(1); } else { M1_VWALK640(0); }
+#undef M1_VWALK640
+                }
+                else if (wg == 512 && ufuse) { M1_VWALK_LX(512,  1); }
                 else if (wg == 512)          { M1_VWALK_LX(512,  0); }
                 else if (ufuse)              { M1_VWALK_LX1024(1); }
                 else                         { M1_VWALK_LX1024(0); }
 #undef M1_VWALK_LX1024
 #undef M1_VWALK_LX
+#undef M1_VWALK_STG
+#undef M1_VWALK_STG_K
 #undef M1_VWALK
+#undef vp
             }
             return;
         }
@@ -6823,7 +7109,28 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                  rt_imma8_split4 && !mach1_rt_stdout_on()));
 
     if (!ofused && !mach1_ablate(MACH1_ABLATE_RT_OUT)) {
-        if (mach1_rt_stdout_on() && rt_imma8_split4) {
+        if (rm != 1) {
+            mach1_timed(stream, std::string("rt_out_hadr") + shp, [&]() {
+            if (mach1_hadr_warp_launch(true, (const float *) sv->data, scr_v, (float *) dst->data,
+                                       m, rm, nt, vsplit, (int64_t) nt*m, stream)) {
+            } else if (nt <= mach1_hadr_wide_max() && mach1_hadr_wg() == 1024) {
+                mach1_launch(mach1_rt_out_hadr_kernel<1024, true>,
+                    ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(1024, 1, 1), (size_t) m*sizeof(float), stream),
+                    (const float *) sv->data, scr_v, (float *) dst->data, m, rm,
+                    vsplit, (int64_t) nt*m);
+            } else if (nt <= mach1_hadr_wide_max()) {
+                mach1_launch(mach1_rt_out_hadr_kernel<512>,
+                    ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), (size_t) m*sizeof(float), stream),
+                    (const float *) sv->data, scr_v, (float *) dst->data, m, rm,
+                    vsplit, (int64_t) nt*m);
+            } else {
+                mach1_launch(mach1_rt_out_hadr_kernel<256>,
+                    ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), (size_t) m*sizeof(float), stream),
+                    (const float *) sv->data, scr_v, (float *) dst->data, m, rm,
+                    vsplit, (int64_t) nt*m);
+            }
+            });
+        } else if (mach1_rt_stdout_on() && rt_imma8_split4) {
             mach1_timed(stream, std::string("rt_out_rs_sum4") + shp, [&]() {
             mach1_rt_out_rs_sum4_p16(
                 (const float *) sv->data, scr_v, (float *) dst->data, stream, nt);
@@ -6849,15 +7156,15 @@ void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         } else
         mach1_timed(stream, std::string("rt_out") + shp, [&]() {
         if (mach1_fwht_wg() == 1024) {
-            mach1_launch(mach1_rt_out_kernel<1024>,
+            mach1_launch_pdl(mach1_rt_out_kernel<1024>,
                 ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(1024, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data, m);
         } else if (mach1_fwht_wg512()) {
-            mach1_launch(mach1_rt_out_kernel<512>,
+            mach1_launch_pdl(mach1_rt_out_kernel<512>,
                 ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(512, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data, m);
         } else {
-            mach1_launch(mach1_rt_out_kernel<256>,
+            mach1_launch_pdl(mach1_rt_out_kernel<256>,
                 ggml_cuda_kernel_launch_params(dim3(nt, 1, 1), dim3(256, 1, 1), 0, stream),
                 (const float *) sv->data, scr_v, (float *) dst->data, m);
         }
@@ -6901,7 +7208,7 @@ int ggml_cuda_mach1_rt_tail_fuse(ggml_backend_cuda_context & ctx, const ggml_cgr
     const ggml_tensor * sv   = rt->src[2];
     const ggml_tensor * tlut = rt->src[3];
     const ggml_tensor * x    = rt->src[4];
-    if (su == nullptr || sv == nullptr || tlut == nullptr || x == nullptr) {
+    if (su == nullptr || sv == nullptr || tlut == nullptr || x == nullptr || !mach1_rt_pow2(rt)) {
         return 0;
     }
 
@@ -11517,8 +11824,8 @@ static bool mach1_gg_i8_ok() {
         const int32_t onei = 1, zeroi = 0;
         const cublasStatus_t st = cublasGemmBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N,
             32, 32, 32,
-            &onei,  (const void **) pv,       CUDA_R_8I,  32,
-                    (const void **) (pv + 1), CUDA_R_8I,  32,
+            &onei,  const_cast<const void **>(pv),     CUDA_R_8I,  32,
+                    const_cast<const void **>(pv + 1), CUDA_R_8I,  32,
             &zeroi, (      void **) (pv + 2), CUDA_R_32I, 32,
             1, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
         int32_t c00 = 0;
@@ -11635,7 +11942,7 @@ void ggml_cuda_op_mach1_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     cudaStream_t stream = ctx.stream();
 
     // p4 repack of the V8 tlut (one-time, cached); nullptr => fp16 gathers
-    mach1_p4_table p4t = {nullptr, nullptr};
+    mach1_p4_table p4t = {};
     if (v8) {
         GGML_ASSERT(tlut->ne[1] == 32768);
         p4t = mach1_exp_p4_table(tlut->data, stream);
@@ -12204,8 +12511,6 @@ void ggml_cuda_op_mach1_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                                                    (size_t) 2*n_hot*sizeof(void *), cudaMemcpyHostToDevice, stream));
                         CUDA_CHECK(cudaMemcpyAsync(pc_alloc.get(), hpc.data(),
                                                    (size_t) n_hot*sizeof(void *), cudaMemcpyHostToDevice, stream));
-                        static std::map<int64_t, cublasHandle_t> bmap;
-                        static std::mutex bmu;
                         const float   onef = 1.0f, zerof = 0.0f;
                         const int32_t onei = 1,    zeroi = 0;
                         for (int i0 = 0; i0 < n_hot;) {
@@ -12214,22 +12519,8 @@ void ggml_cuda_op_mach1_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                             while (i1 < n_hot && hbk[order[i1]] == b) {
                                 ++i1;
                             }
-                            cublasHandle_t cbh;
-                            {
-                                std::lock_guard<std::mutex> lk(bmu);
-                                auto & hh = bmap[((int64_t) m << 40) | ((int64_t) n << 20) |
-                                                 ((int64_t) b << 1) | (gg_i8 ? 1 : 0)];
-                                if (hh == nullptr) {
-                                    CUBLAS_CHECK(cublasCreate(&hh));
-                                    static void * ws = nullptr;
-                                    static const size_t wssz = 32u*1024u*1024u;
-                                    if (ws == nullptr) {
-                                        CUDA_CHECK(cudaMalloc(&ws, wssz));
-                                    }
-                                    CUBLAS_CHECK(cublasSetWorkspace(hh, ws, wssz));
-                                }
-                                cbh = hh;
-                            }
+                            const cublasHandle_t cbh = mach1_cublas(4, ((int64_t) m << 40) | ((int64_t) n << 20) |
+                                                                       ((int64_t) b << 1) | (gg_i8 ? 1 : 0));
                             CUBLAS_CHECK(cublasSetStream(cbh, stream));
                             if (gg_i8) {
                                 CUBLAS_CHECK(cublasGemmBatchedEx(cbh, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -12251,25 +12542,9 @@ void ggml_cuda_op_mach1_exp_mm(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                             i0 = i1;
                         }
                     } else {
-                    static std::map<int64_t, cublasHandle_t> hmap;
-                    static std::mutex hmu;
                     const float onef = 1.0f, zerof = 0.0f;
                     for (int hs = 0; hs < n_hot; ++hs) {
-                        cublasHandle_t cbh;
-                        {
-                            std::lock_guard<std::mutex> lk(hmu);
-                            auto & hh = hmap[((int64_t) m << 40) | ((int64_t) n << 20) | hbk[hs]];
-                            if (hh == nullptr) {
-                                CUBLAS_CHECK(cublasCreate(&hh));
-                                static void * ws = nullptr;
-                                static const size_t wssz = 32u*1024u*1024u;
-                                if (ws == nullptr) {
-                                    CUDA_CHECK(cudaMalloc(&ws, wssz));
-                                }
-                                CUBLAS_CHECK(cublasSetWorkspace(hh, ws, wssz));
-                            }
-                            cbh = hh;
-                        }
+                        const cublasHandle_t cbh = mach1_cublas(5, ((int64_t) m << 40) | ((int64_t) n << 20) | hbk[hs]);
                         CUBLAS_CHECK(cublasSetStream(cbh, stream));
                         CUBLAS_CHECK(cublasGemmEx(cbh, CUBLAS_OP_T, CUBLAS_OP_N,
                             m, hbk[hs], n,
@@ -13289,7 +13564,8 @@ int ggml_cuda_mach1_exp_ffn_fuse(ggml_backend_cuda_context & ctx, const ggml_cgr
         });
     }
     if (mega_qns && nb > 0) {
-        static bool qns_attr = false;
+        static bool qns_attr_d[GGML_CUDA_MAX_DEVICES] = {false};
+        bool & qns_attr = qns_attr_d[ggml_cuda_get_device()];
         if (!qns_attr) {
             CUDA_CHECK(cudaFuncSetAttribute(mach1_exp_mega_kernel<32, 1, MACH1_EXP_MEGA_WG, false, 1, 0, true, false, false, 128, false, false, true>,
                 cudaFuncAttributePreferredSharedMemoryCarveout, 0));
@@ -13430,7 +13706,8 @@ int ggml_cuda_mach1_exp_ffn_fuse(ggml_backend_cuda_context & ctx, const ggml_cgr
             const int qsns = qsplit ? std::max(0, std::min(2, qs_ns_env)) : 0;
             const size_t qs_smem = qsns ? MACH1_EXP_MEGA_SMEM_NOSTAGE : MACH1_EXP_MEGA_SMEM_HALF;
             if (qsplit) {
-                static bool qs_attr = false;
+                static bool qs_attr_d[GGML_CUDA_MAX_DEVICES] = {false};
+                bool & qs_attr = qs_attr_d[ggml_cuda_get_device()];
                 if (!qs_attr) {
                     CUDA_CHECK(cudaFuncSetAttribute(mach1_exp_mega_kernel<32,  1, 512, true, 2, 1, true, false, false, 128, false, true>,
                         cudaFuncAttributePreferredSharedMemoryCarveout, 100));
@@ -13533,7 +13810,8 @@ int ggml_cuda_mach1_exp_ffn_fuse(ggml_backend_cuda_context & ctx, const ggml_cgr
                              slot ? MACH1_EXP_MEGA_VB : tw*(mega_wg/128));
 
         if (slot) {
-            static bool slot_attr = false;
+            static bool slot_attr_d[GGML_CUDA_MAX_DEVICES] = {false};
+            bool & slot_attr = slot_attr_d[ggml_cuda_get_device()];
             if (!slot_attr) {
                 CUDA_CHECK(cudaFuncSetAttribute(mach1_exp_slot_kernel<128, false>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int) MACH1_EXP_SLOT_SMEM));
@@ -14088,6 +14366,9 @@ int ggml_cuda_mach1_shexp_fuse(ggml_backend_cuda_context & ctx, const ggml_cgrap
         return 0;
     }
     if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != gp || silu->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (!mach1_rt_pow2(gp) || !mach1_rt_pow2(up) || !mach1_rt_pow2(down)) {
         return 0;
     }
     if (par->src[0] != silu || par->src[1] != up || par->type != GGML_TYPE_F32 || !ggml_is_contiguous(par)) {
@@ -14881,7 +15162,8 @@ static void mach1_rt_walk_tt_launch(cudaStream_t stream,
         ggml_cuda_kernel_launch_params(dim3(blk, 1, (nt + ttc - 1)/ttc), dim3(wg, 1, 1), 0, stream);
 #define M1_TTW_H(WGT, TTV, ZD) \
     do { if (minb >= 2 && WGT == 512) { \
-        static bool carve = false; \
+        static bool carve_d[GGML_CUDA_MAX_DEVICES] = {false}; \
+        bool & carve = carve_d[ggml_cuda_get_device()]; \
         if (!carve) { carve = true; \
             cudaFuncSetAttribute((const void *) mach1_rt_walk_tt_pair_kernel<WGT, TTV, ZD, 2>, \
                 cudaFuncAttributePreferredSharedMemoryCarveout, 100); \
@@ -15158,7 +15440,7 @@ static int mach1_rt_batch_exec(ggml_backend_cuda_context & ctx, const char * key
         mach1_rt_u_batch ub[3] = {};
         for (int i = 0; i < nops; ++i) {
             ub[i].su    = ops[i].su;
-            ub[i].scr_u = (float *) ops[i].scr_u;
+            ub[i].scr_u = const_cast<float *>(ops[i].scr_u);
         }
         if (zf != nullptr) {
             // the z fork's walk reads u from private scratch only - the pool
@@ -15696,6 +15978,9 @@ int ggml_cuda_mach1_vtiled_fuse(ggml_backend_cuda_context & ctx, const ggml_cgra
     if (rt->src[0]->ne[0] != 64 || rt->src[3]->ne[0] != 2 || rt->src[3]->ne[1] != 512) {
         return 0;
     }
+    if (!mach1_rt_pow2(rt)) {
+        return 0;
+    }
     // nt <= 4: the established qkvz PAIR path token-slices through the TT
     // batch exec. The default-off exact-nt16 admission keeps both existing
     // compressed MMA spines and batches only their sibling u/out transforms;
@@ -15765,7 +16050,7 @@ int ggml_cuda_mach1_vtiled_fuse(ggml_backend_cuda_context & ctx, const ggml_cgra
                     const ggml_tensor * rtz = cgraph->nodes[node_idx + 10];
                     ggml_tensor       * cvz = cgraph->nodes[node_idx + 13];
                     int hdz = 0, Kz = 0, rz = 0;
-                    const int mz = rtz->op == GGML_OP_MACH1_RT_MM ? (int) rtz->src[2]->ne[0] : 0;
+                    const int mz = rtz->op == GGML_OP_MACH1_RT_MM && mach1_rt_pow2(rtz) ? (int) rtz->src[2]->ne[0] : 0;
                     if (mz > 0 && mz % 16 == 0 && mz <= 8192 && (n/16 <= 128 || mz <= 4096) &&
                         rtz->src[4] == x && rtz->src[3] == rt->src[3] &&
                         rtz->src[0]->ne[0] == 64 && (int) rtz->src[1]->ne[0] == n &&
@@ -15877,7 +16162,7 @@ int ggml_cuda_mach1_xperm_fuse(ggml_backend_cuda_context & ctx, const ggml_cgrap
     const ggml_tensor * rs2 = cgraph->nodes[node_idx + 1];
     ggml_tensor       * rt  = cgraph->nodes[node_idx + 2];
     if (rs2->op != GGML_OP_RESHAPE || rs2->src[0] != c || ggml_nrows(rs2) != 1 ||
-        rt->op != GGML_OP_MACH1_RT_MM || rt->src[4] != rs2) {
+        rt->op != GGML_OP_MACH1_RT_MM || rt->src[4] != rs2 || !mach1_rt_pow2(rt)) {
         return 0;
     }
     if (rt->src[0]->ne[0] != 64 || rt->src[3]->ne[0] != 2 || rt->src[3]->ne[1] != 512 ||
@@ -15936,7 +16221,7 @@ int ggml_cuda_mach1_qkv_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph 
     const ggml_tensor * rt[3];
     for (int i = 0; i < 3; ++i) {
         rt[i] = cgraph->nodes[node_idx + i];
-        if (rt[i]->op != GGML_OP_MACH1_RT_MM) {
+        if (rt[i]->op != GGML_OP_MACH1_RT_MM || !mach1_rt_pow2(rt[i])) {
             return 0;
         }
     }
@@ -16998,7 +17283,7 @@ int ggml_cuda_mach1_gdn_full_fuse(ggml_backend_cuda_context & ctx, const ggml_cg
         // (folding it is unsafe across seqs - s_copy may name another seq's
         // scatter row after a slot shuffle, and blocks of different seqs
         // have no ordering), run here since the region swallowed its node
-        ggml_cuda_op_get_rows(ctx, (ggml_tensor *) gr);
+        ggml_cuda_op_get_rows(ctx, const_cast<ggml_tensor *>(gr));
     }
 
     char shp[80];
@@ -17286,32 +17571,2380 @@ int ggml_cuda_mach1_gdn_proj_fuse(ggml_backend_cuda_context & ctx, const ggml_cg
 // supports_op — mirrors the Vulkan predicate (ggml-vulkan.cpp)
 //
 
+__constant__ int8_t mach1_h12_dev[12][12] = {
+    {  1, -1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1 },
+    { -1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1 },
+    {  1,  1,  1, -1,  1,  1, -1, -1, -1, -1,  1,  1 },
+    {  1, -1, -1, -1,  1, -1, -1,  1, -1,  1,  1, -1 },
+    {  1,  1,  1,  1,  1, -1,  1,  1, -1, -1, -1, -1 },
+    {  1, -1,  1, -1, -1, -1,  1, -1, -1,  1, -1,  1 },
+    {  1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1 },
+    {  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1 },
+    {  1,  1, -1, -1, -1, -1,  1,  1,  1, -1,  1,  1 },
+    {  1, -1, -1,  1, -1,  1,  1, -1, -1, -1,  1, -1 },
+    {  1,  1,  1,  1, -1, -1, -1, -1,  1,  1,  1, -1 },
+    {  1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1, -1 },
+};
+
+__constant__ int8_t mach1_h20_dev[20][20] = {
+    {  1, -1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1 },
+    { -1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1 },
+    {  1,  1,  1, -1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1 },
+    {  1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1 },
+    {  1,  1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1 },
+    {  1, -1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1 },
+    {  1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1 },
+    {  1, -1,  1, -1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1 },
+    {  1,  1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1 },
+    {  1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1 },
+    {  1,  1, -1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1 },
+    {  1, -1, -1,  1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1,  1 },
+    {  1,  1, -1, -1, -1, -1,  1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1 },
+    {  1, -1, -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1 },
+    {  1,  1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1 },
+    {  1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1,  1, -1 },
+    {  1,  1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1 },
+    {  1, -1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1 },
+    {  1,  1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1,  1,  1,  1,  1,  1, -1 },
+    {  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1 },
+};
+
+static __device__ void mach1_da_fwht(float * sh, float * tmp, const int d, const int tid, const int wg) {
+    if ((d & (d - 1)) == 0) {
+        mach1_fwht_block<false>(sh, d, tid, wg);
+        __syncthreads();
+        const float sc = __fsqrt_rn((float) d);
+        for (int i = tid; i < d; i += wg) {
+            sh[i] = __fdiv_rn(sh[i], sc);
+        }
+        __syncthreads();
+        return;
+    }
+    const int radix = (d % 12 == 0 && (((d/12) & (d/12 - 1)) == 0)) ? 12 : 20;
+    const int M     = d/radix;
+    const float scm = __fsqrt_rn((float) M);
+    for (int span = 1, ls = 0; span < M; span <<= 1, ++ls) {
+        for (int idx = tid; idx < d/2; idx += wg) {
+            const int a    = idx/(M/2);
+            const int j    = idx % (M/2);
+            const int base = a*M + ((j >> ls) << (ls + 1)) + (j & (span - 1));
+            const float a0 = sh[base];
+            const float a1 = sh[base + span];
+            sh[base]        = a0 + a1;
+            sh[base + span] = a0 - a1;
+        }
+        __syncthreads();
+    }
+    for (int i = tid; i < d; i += wg) {
+        sh[i] = __fdiv_rn(sh[i], scm);
+    }
+    __syncthreads();
+    const int8_t * Hr = radix == 12 ? &mach1_h12_dev[0][0] : &mach1_h20_dev[0][0];
+    const float   scr = __fsqrt_rn((float) radix);
+    for (int i = tid; i < d; i += wg) {
+        const int a = i/M, b = i % M;
+        float acc = 0.0f;
+        for (int c = 0; c < radix; ++c) {
+            acc = __fadd_rn(acc, __fmul_rn((float) Hr[a*radix + c], sh[c*M + b]));
+        }
+        tmp[i] = __fdiv_rn(acc, scr);
+    }
+    __syncthreads();
+    for (int i = tid; i < d; i += wg) {
+        sh[i] = tmp[i];
+    }
+    __syncthreads();
+}
+
+static size_t mach1_da_smem(const int64_t d) {
+    return sizeof(float)*(size_t) (((d & (d - 1)) != 0 ? 2 : 1)*d);
+}
+
+static __global__ void mach1_da_decode_kernel(
+        const uint16_t * __restrict__ tr,
+        const float    * __restrict__ tlut,
+        const half     * __restrict__ gm,
+        float          * __restrict__ wbuf,
+        const int words, const int mode, const int Mb, const int Nb, const int64_t total,
+        const int32_t * __restrict__ mask, const int e) {
+    if (mask != nullptr && mask[e] == 0) {
+        return;
+    }
+    const int64_t gid = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (gid >= total) {
+        return;
+    }
+    const int64_t td = gid >> 5;
+    const int     i  = (int)(gid & 31);
+    const int64_t rb = td / Nb, cb = td % Nb;
+    const int64_t wv = (rb + cb <= Nb - 1) ? Mb + Nb - 1 - (rb + cb)
+                                           : Mb + Nb - 2 - (rb + cb);
+    const float gsc = __half2float(gm[wv]);
+
+    const uint16_t * tw = tr + td*words;
+    const int      step = words/2;
+    const int      b    = step*i;
+    const int      wi   = b >> 4;
+    const int      o    = b & 15;
+    const uint32_t w2   = ((uint32_t) tw[wi] << 16) |
+                           (uint32_t) tw[wi + 1 < words ? wi + 1 : 0];
+    const uint32_t reg  = (w2 >> (16 - o)) & 0xFFFFu;
+    const uint32_t p    = reg*(reg + 1);
+    const uint32_t row  = (mode ? p >> 1 : p) & 0x7FFFu;
+    const uint32_t ng   = (p >> (mode ? 16 : 15)) & 1u;
+
+    const int     ri   = (8*i) >> 4;
+    const int     ci   = (8*i) & 15;
+    const int64_t nb64 = (int64_t) Nb*16;
+    float * wo = wbuf + (rb*16 + ri)*nb64 + cb*16 + ci;
+    const float * ws = tlut + 8*row;
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        float w = (c == 0 && ng) ? -ws[c] : ws[c];
+        w = __fmul_rn(w, gsc);
+        wo[c] = __half2float(__float2half_rn(w));
+    }
+}
+
+template <int WG>
+__global__ void mach1_da_rows_kernel(float * __restrict__ f, const half * __restrict__ su, const int n,
+                                     const int32_t * __restrict__ mask, const int e) {
+    if (mask != nullptr && mask[e] == 0) {
+        return;
+    }
+    extern __shared__ float da_sh[];
+    float * tmp = da_sh + n;
+    const int64_t r   = blockIdx.x;
+    const int     tid = threadIdx.x;
+    for (int i = tid; i < n; i += WG) {
+        da_sh[i] = f[r*n + i];
+    }
+    __syncthreads();
+    mach1_da_fwht(da_sh, tmp, n, tid, WG);
+    for (int i = tid; i < n; i += WG) {
+        f[r*n + i] = __fmul_rn(da_sh[i], __half2float(su[i]));
+    }
+}
+
+template <int WG>
+__global__ void mach1_da_cols_kernel(float * __restrict__ f, const half * __restrict__ sv,
+                                     const int m, const int n,
+                                     const int32_t * __restrict__ mask, const int e) {
+    if (mask != nullptr && mask[e] == 0) {
+        return;
+    }
+    extern __shared__ float da_sh[];
+    float * tmp = da_sh + m;
+    const int c   = blockIdx.x;
+    const int tid = threadIdx.x;
+    for (int i = tid; i < m; i += WG) {
+        da_sh[i] = f[(int64_t) i*n + c];
+    }
+    __syncthreads();
+    mach1_da_fwht(da_sh, tmp, m, tid, WG);
+    for (int i = tid; i < m; i += WG) {
+        f[(int64_t) i*n + c] = __fmul_rn(da_sh[i], __half2float(sv[i]));
+    }
+}
+
+static __global__ void mach1_da_apply_kernel(
+        const float * __restrict__ w,
+        const float * __restrict__ x,
+        float       * __restrict__ dst,
+        const int mb, const int nb, const int n, const int m, const int nt,
+        const int64_t xoff, const int64_t yoff, const int accumulate) {
+    constexpr int warp_size = 32;
+    const int64_t wid  = ((int64_t) blockIdx.x*blockDim.x + threadIdx.x)/warp_size;
+    const int     lane = threadIdx.x % warp_size;
+    if (wid >= (int64_t) mb*nt) {
+        return;
+    }
+    const int64_t row = wid % mb;
+    const int64_t tok = wid / mb;
+    const float * wr = w + row*nb;
+    const float * xc = x + tok*n + xoff;
+    float acc = 0.0f;
+    for (int i = lane; i < nb; i += warp_size) {
+        acc += wr[i]*xc[i];
+    }
+#pragma unroll
+    for (int sh = warp_size/2; sh > 0; sh >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, sh);
+    }
+    if (lane == 0) {
+        float * o = dst + tok*m + yoff + row;
+        *o = accumulate ? *o + acc : acc;
+    }
+}
+
+static __global__ void mach1_da_exc_kernel(
+        const int32_t  * __restrict__ eid,
+        const uint16_t * __restrict__ rows,
+        const float    * __restrict__ x,
+        float          * __restrict__ dst,
+        const int n, const int m, const int nt, const int n_exc, const int exc_base) {
+    constexpr int warp_size = 32;
+    const int wid  = (blockIdx.x*blockDim.x + threadIdx.x)/warp_size;
+    const int lane = threadIdx.x % warp_size;
+    if (wid >= n_exc*nt) {
+        return;
+    }
+    const int j   = wid % n_exc;
+    const int tok = wid / n_exc;
+    const uint16_t * er = rows + (int64_t) j*n;
+    const float    * xc = x + (int64_t) tok*n;
+    float acc = 0.0f;
+    for (int i = lane; i < n; i += warp_size) {
+        acc += __uint_as_float((uint32_t) er[i] << 16)*xc[i];
+    }
+#pragma unroll
+    for (int sh = warp_size/2; sh > 0; sh >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, sh);
+    }
+    if (lane == 0) {
+        dst[(int64_t) tok*m + (eid[j] - exc_base)] = acc;
+    }
+}
+
+static void mach1_da_decode_block_cuda(
+        ggml_backend_cuda_context & ctx, const uint16_t * tr, const float * tlut,
+        const half * su, const half * sv, const half * gm,
+        const int words, const int mode, const int64_t mb, const int64_t nb,
+        float * wbuf, const int32_t * mask, const int e) {
+    constexpr int WG = 256;
+    const int64_t tiles = (mb/16)*(nb/16);
+    const int64_t total = tiles*32;
+    {
+        const dim3 grid((unsigned)((total + WG - 1)/WG), 1, 1);
+        mach1_timed(ctx.stream(), "da_dec", [&] { mach1_launch(mach1_da_decode_kernel,
+                ggml_cuda_kernel_launch_params(grid, dim3(WG, 1, 1), 0, ctx.stream()),
+                tr, tlut, gm, wbuf, words, mode, (int)(mb/16), (int)(nb/16), total, mask, e); });
+    }
+    {
+        const size_t smem = mach1_da_smem(nb);
+        if (smem > 48*1024) {
+            mach1_smem_opt_in((const void *) mach1_da_rows_kernel<WG>, smem);
+        }
+        mach1_timed(ctx.stream(), "da_rows", [&] { mach1_launch(mach1_da_rows_kernel<WG>,
+                ggml_cuda_kernel_launch_params(dim3((unsigned) mb, 1, 1), dim3(WG, 1, 1), smem, ctx.stream()),
+                wbuf, su, (int) nb, mask, e); });
+    }
+    {
+        const size_t smem = mach1_da_smem(mb);
+        if (smem > 48*1024) {
+            mach1_smem_opt_in((const void *) mach1_da_cols_kernel<WG>, smem);
+        }
+        mach1_timed(ctx.stream(), "da_cols", [&] { mach1_launch(mach1_da_cols_kernel<WG>,
+                ggml_cuda_kernel_launch_params(dim3((unsigned) nb, 1, 1), dim3(WG, 1, 1), smem, ctx.stream()),
+                wbuf, sv, (int) mb, (int) nb, mask, e); });
+    }
+}
+
+template <int WG>
+__global__ void mach1_da_u_kernel(
+        const float * __restrict__ x,
+        const half  * __restrict__ su,
+        float       * __restrict__ scr_u,
+        const int n, const int nb, const int split) {
+    extern __shared__ float da_sh[];
+    float * tmp = da_sh + nb;
+    const int e   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int nt  = gridDim.y;
+    const int tid = threadIdx.x;
+    const float * xc = x + (int64_t) t*n + (split == 1 ? (int64_t) e*nb : 0);
+    for (int i = tid; i < nb; i += WG) {
+        da_sh[i] = __fmul_rn(__half2float(su[(int64_t) e*nb + i]), xc[i]);
+    }
+    __syncthreads();
+    mach1_da_fwht(da_sh, tmp, nb, tid, WG);
+    float * u = scr_u + ((int64_t) e*nt + t)*nb;
+    for (int i = tid; i < nb; i += WG) {
+        u[i] = da_sh[i];
+    }
+}
+
+template <int WG>
+__global__ void mach1_da_walk_kernel(
+        const uint16_t * __restrict__ trellis,
+        const float    * __restrict__ tlut,
+        const half     * __restrict__ gm,
+        const float    * __restrict__ scr_u,
+        float          * __restrict__ scr_v,
+        const int words, const int mode, const int Mb, const int Nb,
+        const int gl, const int nb) {
+    __shared__ float red[16][WG/32];
+    const int rb  = blockIdx.x;
+    const int e   = blockIdx.y;
+    const int t   = blockIdx.z;
+    const int nt  = gridDim.z;
+    const int tid = threadIdx.x;
+
+    const uint16_t * tr = trellis + ((int64_t) e*Mb*Nb)*words;
+    const float    * u  = scr_u + ((int64_t) e*nt + t)*nb;
+    const int step = words/2;
+
+    float partial[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        partial[i] = 0.0f;
+    }
+
+    for (int cb = tid; cb < Nb; cb += WG) {
+        const int64_t td = (int64_t) rb*Nb + cb;
+        const uint16_t * tw = tr + td*words;
+        const int64_t wv = (rb + cb <= Nb - 1) ? Mb + Nb - 1 - (rb + cb)
+                                               : Mb + Nb - 2 - (rb + cb);
+        const float gsc = __half2float(gm[(int64_t) e*gl + wv]);
+        const float * uc = u + cb*16;
+#pragma unroll 4
+        for (int i = 0; i < 32; ++i) {
+            const int      b   = step*i;
+            const int      wi  = b >> 4;
+            const int      o   = b & 15;
+            const uint32_t w2  = ((uint32_t) tw[wi] << 16) |
+                                  (uint32_t) tw[wi + 1 < words ? wi + 1 : 0];
+            const uint32_t reg = (w2 >> (16 - o)) & 0xFFFFu;
+            const uint32_t p   = reg*(reg + 1);
+            const uint32_t row = (mode ? p >> 1 : p) & 0x7FFFu;
+            const uint32_t ng  = (p >> (mode ? 16 : 15)) & 1u;
+            const int      ri  = (8*i) >> 4;
+            const int      ci  = (8*i) & 15;
+            const float * ws = tlut + 8*row;
+            float acc = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                float w = (c == 0 && ng) ? -ws[c] : ws[c];
+                w = __half2float(__float2half_rn(__fmul_rn(w, gsc)));
+                acc += w*uc[ci + c];
+            }
+            partial[ri] += acc;
+        }
+    }
+
+    const int lane = tid % 32;
+    const int wid  = tid / 32;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        float s = partial[i];
+#pragma unroll
+        for (int sh = 16; sh > 0; sh >>= 1) {
+            s += __shfl_xor_sync(0xffffffff, s, sh);
+        }
+        if (lane == 0) {
+            red[i][wid] = s;
+        }
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WG/32; ++w) {
+            s += red[tid][w];
+        }
+        scr_v[((int64_t) e*nt + t)*(int64_t) Mb*16 + rb*16 + tid] = s;
+    }
+}
+
+#define MACH1_DA_TPW 4
+
+template <int WG, int TPW, int PROBE, bool L16>
+__global__ void mach1_da_walk_tiles_kernel(
+        const uint16_t * __restrict__ trellis,
+        const float    * __restrict__ tlut,
+        const half     * __restrict__ tlut16,
+        const half     * __restrict__ gm,
+        const float    * __restrict__ scr_u,
+        float          * __restrict__ scr_p,
+        const int words, const int mode, const int Mb, const int Nb,
+        const int gl, const int nb, const int nt, const int nchunks) {
+    constexpr int n_warps = WG/32;
+    __shared__ float red[n_warps][16];
+    __shared__ float smu[n_warps*TPW*16];
+    const int rb    = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int et    = blockIdx.z;
+    const int e     = et/nt;
+    const int lane  = threadIdx.x % 32;
+    const int wid   = threadIdx.x / 32;
+
+    const uint16_t * tr = trellis + ((int64_t) e*Mb*Nb)*words;
+    const float    * u  = scr_u + (int64_t) et*nb;
+    const int step = words/2;
+
+    const int b   = step*lane;
+    const int wi0 = b >> 4;
+    const int o   = b & 15;
+    const int ri  = (8*lane) >> 4;
+    const int ci  = (8*lane) & 15;
+
+    const int blk0 = chunk*n_warps*TPW;
+    {
+        const int span = min(n_warps*TPW, Nb - blk0)*16;
+        for (int i = threadIdx.x; i < span; i += WG) {
+            smu[i] = u[blk0*16 + i];
+        }
+        __syncthreads();
+    }
+
+    const int cb0 = (chunk*n_warps + wid)*TPW;
+    const int nq  = cb0 < Nb ? min(TPW, Nb - cb0) : 0;
+    const int cbb = cb0 < Nb ? cb0 : 0;
+
+    float    gsc[TPW];
+    uint32_t neg[TPW];
+    float4   g0 [TPW];
+    float4   g1 [TPW];
+
+#pragma unroll
+    for (int q = 0; q < TPW; ++q) {
+        const int cb = cbb + (q < nq ? q : 0);
+        const uint16_t * tw = tr + ((int64_t) rb*Nb + cb)*words;
+        const int64_t wv = (rb + cb <= Nb - 1) ? Mb + Nb - 1 - (rb + cb)
+                                               : Mb + Nb - 2 - (rb + cb);
+        gsc[q] = __half2float(gm[(int64_t) e*gl + wv]);
+        const uint32_t w2  = ((uint32_t) tw[wi0] << 16) |
+                              (uint32_t) tw[wi0 + 1 < words ? wi0 + 1 : 0];
+        const uint32_t reg = (w2 >> (16 - o)) & 0xFFFFu;
+        const uint32_t p   = reg*(reg + 1);
+        const uint32_t row = (mode ? p >> 1 : p) & 0x7FFFu;
+        neg[q] = (p >> (mode ? 16 : 15)) & 1u;
+        if (PROBE & 1) {
+            const float k = 1.0f + (float)(row & 1u);
+            g0[q] = make_float4(k, k, k, k);
+            g1[q] = g0[q];
+        } else if (L16) {
+            const uint4   hv = *(const uint4 *)(tlut16 + 8*row);
+            const half2 * hp = (const half2 *) &hv;
+            const float2 a = __half22float2(hp[0]);
+            const float2 c = __half22float2(hp[1]);
+            const float2 d = __half22float2(hp[2]);
+            const float2 f = __half22float2(hp[3]);
+            g0[q] = make_float4(a.x, a.y, c.x, c.y);
+            g1[q] = make_float4(d.x, d.y, f.x, f.y);
+        } else {
+            g0[q] = *(const float4 *)(tlut + 8*row);
+            g1[q] = *(const float4 *)(tlut + 8*row + 4);
+        }
+    }
+
+    float part = 0.0f;
+#pragma unroll
+    for (int q = 0; q < TPW; ++q) {
+        if (q >= nq) {
+            continue;
+        }
+        float w[8];
+        w[0] = neg[q] ? -g0[q].x : g0[q].x;
+        w[1] = g0[q].y;
+        w[2] = g0[q].z;
+        w[3] = g0[q].w;
+        w[4] = g1[q].x;
+        w[5] = g1[q].y;
+        w[6] = g1[q].z;
+        w[7] = g1[q].w;
+        const float * uc = smu + (cbb + q - blk0)*16 + ci;
+        const float4 u0 = *(const float4 *)(uc);
+        const float4 u1 = *(const float4 *)(uc + 4);
+        const float uv[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+        const float   gs = gsc[q];
+        float acc = 0.0f;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            const float ws = (PROBE & 2)
+                ? __fmul_rn(w[c], gs)
+                : __half2float(__float2half_rn(__fmul_rn(w[c], gs)));
+            acc += ws*uv[c];
+        }
+        part += acc;
+    }
+
+    {
+        float sred = part;
+        sred += __shfl_xor_sync(0xffffffff, sred, 1);
+        if ((lane & 1) == 0) {
+            red[wid][ri] = sred;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 16) {
+        float sred = 0.0f;
+#pragma unroll
+        for (int w2i = 0; w2i < n_warps; ++w2i) {
+            sred += red[w2i][threadIdx.x];
+        }
+        scr_p[(((int64_t) et*Mb + rb)*nchunks + chunk)*16 + threadIdx.x] = sred;
+    }
+}
+
+template <int WG, int PROBE, bool L16>
+__global__ void mach1_da_walk_deep_kernel(
+        const uint16_t * __restrict__ trellis,
+        const float    * __restrict__ tlut,
+        const half     * __restrict__ tlut16,
+        const half     * __restrict__ gm,
+        const float    * __restrict__ scr_u,
+        float          * __restrict__ scr_p,
+        const int words, const int mode, const int Mb, const int Nb,
+        const int gl, const int nb, const int nt, const int nchunks,
+        const int depth) {
+    constexpr int n_warps = WG/32;
+    extern __shared__ float smu[];
+    __shared__ float red[n_warps][16];
+    const int rb    = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int et    = blockIdx.z;
+    const int e     = et/nt;
+    const int lane  = threadIdx.x % 32;
+    const int wid   = threadIdx.x / 32;
+
+    const uint16_t * tr = trellis + ((int64_t) e*Mb*Nb)*words;
+    const float    * u  = scr_u + (int64_t) et*nb;
+    const int step = words/2;
+
+    const int blk0 = chunk*n_warps*depth;
+    {
+        const int span = min(n_warps*depth, Nb - blk0)*16;
+        for (int i = threadIdx.x; i < span; i += WG) {
+            smu[i] = u[blk0*16 + i];
+        }
+        __syncthreads();
+    }
+
+    const int b   = step*lane;
+    const int wi0 = b >> 4;
+    const int o   = b & 15;
+    const int ri  = (8*lane) >> 4;
+    const int ci  = (8*lane) & 15;
+
+    const int cb0    = (chunk*n_warps + wid)*depth;
+    const int cb_end = min(cb0 + depth, Nb);
+
+    float part = 0.0f;
+    for (int cbb = cb0; cbb < cb_end; cbb += 4) {
+        const int nq = min(4, cb_end - cbb);
+        float    gsc[4];
+        uint32_t neg[4];
+        float4   g0 [4];
+        float4   g1 [4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int cb = cbb + (q < nq ? q : 0);
+            const uint16_t * tw = tr + ((int64_t) rb*Nb + cb)*words;
+            const int64_t wv = (rb + cb <= Nb - 1) ? Mb + Nb - 1 - (rb + cb)
+                                                   : Mb + Nb - 2 - (rb + cb);
+            gsc[q] = __half2float(gm[(int64_t) e*gl + wv]);
+            const uint32_t w2  = ((uint32_t) tw[wi0] << 16) |
+                                  (uint32_t) tw[wi0 + 1 < words ? wi0 + 1 : 0];
+            const uint32_t reg = (w2 >> (16 - o)) & 0xFFFFu;
+            const uint32_t pp  = reg*(reg + 1);
+            const uint32_t row = (mode ? pp >> 1 : pp) & 0x7FFFu;
+            neg[q] = (pp >> (mode ? 16 : 15)) & 1u;
+            if (PROBE & 1) {
+                const float k = 1.0f + (float)(row & 1u);
+                g0[q] = make_float4(k, k, k, k);
+                g1[q] = g0[q];
+            } else if (L16) {
+                const uint4   hv = *(const uint4 *)(tlut16 + 8*row);
+                const half2 * hp = (const half2 *) &hv;
+                const float2 a = __half22float2(hp[0]);
+                const float2 c = __half22float2(hp[1]);
+                const float2 d = __half22float2(hp[2]);
+                const float2 f = __half22float2(hp[3]);
+                g0[q] = make_float4(a.x, a.y, c.x, c.y);
+                g1[q] = make_float4(d.x, d.y, f.x, f.y);
+            } else {
+                g0[q] = *(const float4 *)(tlut + 8*row);
+                g1[q] = *(const float4 *)(tlut + 8*row + 4);
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            if (q >= nq) {
+                continue;
+            }
+            float w[8];
+            w[0] = neg[q] ? -g0[q].x : g0[q].x;
+            w[1] = g0[q].y;
+            w[2] = g0[q].z;
+            w[3] = g0[q].w;
+            w[4] = g1[q].x;
+            w[5] = g1[q].y;
+            w[6] = g1[q].z;
+            w[7] = g1[q].w;
+            const float * uc = smu + (cbb + q - blk0)*16 + ci;
+            const float4 u0 = *(const float4 *)(uc);
+            const float4 u1 = *(const float4 *)(uc + 4);
+            const float uv[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+            const float   gs = gsc[q];
+            float acc = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                const float ws = (PROBE & 2)
+                    ? __fmul_rn(w[c], gs)
+                    : __half2float(__float2half_rn(__fmul_rn(w[c], gs)));
+                acc += ws*uv[c];
+            }
+            part += acc;
+        }
+    }
+
+    {
+        float sred = part;
+        sred += __shfl_xor_sync(0xffffffff, sred, 1);
+        if ((lane & 1) == 0) {
+            red[wid][ri] = sred;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 16) {
+        float sred = 0.0f;
+#pragma unroll
+        for (int w2i = 0; w2i < n_warps; ++w2i) {
+            sred += red[w2i][threadIdx.x];
+        }
+        scr_p[(((int64_t) et*Mb + rb)*nchunks + chunk)*16 + threadIdx.x] = sred;
+    }
+}
+
+#define MACH1_DA_DSM_CLUSTER 8
+#define MACH1_DA_DSM_ROWS    4096
+
+template <int WG>
+__global__ void mach1_da_walk_dsm_kernel(
+        const uint16_t * __restrict__ trellis,
+        const float    * __restrict__ tlut,
+        const half     * __restrict__ gm,
+        const float    * __restrict__ scr_u,
+        float          * __restrict__ scr_p,
+        const int words, const int mode, const int Mb, const int Nb,
+        const int gl, const int nb, const int nt, const int depth,
+        const int64_t n_tuples) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    namespace cg = cooperative_groups;
+    constexpr int n_warps = WG/32;
+    extern __shared__ float sm_book[];
+    __shared__ float red[n_warps][16];
+
+    cg::cluster_group cluster = cg::this_cluster();
+    const unsigned rank = cluster.block_rank();
+
+    {
+        const float * src = tlut + (size_t) rank*MACH1_DA_DSM_ROWS*8;
+        for (int i = threadIdx.x; i < MACH1_DA_DSM_ROWS*8; i += WG) {
+            sm_book[i] = src[i];
+        }
+    }
+    cluster.sync();
+
+    const int lane = threadIdx.x % 32;
+    const int wid  = threadIdx.x / 32;
+    const int step = words/2;
+    const int b    = step*lane;
+    const int wi0  = b >> 4;
+    const int o    = b & 15;
+    const int ri   = (8*lane) >> 4;
+    const int ci   = (8*lane) & 15;
+
+    const int64_t nclblk = (int64_t) gridDim.x;
+    for (int64_t tup = blockIdx.x; tup < n_tuples; tup += nclblk) {
+        const int et = (int)(tup/Mb);
+        const int rb = (int)(tup % Mb);
+        const int e  = et/nt;
+        const uint16_t * tr = trellis + ((int64_t) e*Mb*Nb)*words;
+        const float    * u  = scr_u + (int64_t) et*nb;
+
+        const int cb0    = wid*depth;
+        const int cb_end = min(cb0 + depth, Nb);
+
+        float part = 0.0f;
+        for (int cbb = cb0; cbb < cb_end; cbb += 4) {
+            const int nq = min(4, cb_end - cbb);
+            float    gsc[4];
+            uint32_t neg[4];
+            float4   g0 [4];
+            float4   g1 [4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int cb = cbb + (q < nq ? q : 0);
+                const uint16_t * tw = tr + ((int64_t) rb*Nb + cb)*words;
+                const int64_t wv = (rb + cb <= Nb - 1) ? Mb + Nb - 1 - (rb + cb)
+                                                       : Mb + Nb - 2 - (rb + cb);
+                gsc[q] = __half2float(gm[(int64_t) e*gl + wv]);
+                const uint32_t w2  = ((uint32_t) tw[wi0] << 16) |
+                                      (uint32_t) tw[wi0 + 1 < words ? wi0 + 1 : 0];
+                const uint32_t rg  = (w2 >> (16 - o)) & 0xFFFFu;
+                const uint32_t pp  = rg*(rg + 1);
+                const uint32_t row = (mode ? pp >> 1 : pp) & 0x7FFFu;
+                neg[q] = (pp >> (mode ? 16 : 15)) & 1u;
+                const unsigned    rrank = row >> 12;
+                const float * bp = (const float *) cluster.map_shared_rank(
+                                       (void *) sm_book, rrank)
+                                   + (size_t)(row & (MACH1_DA_DSM_ROWS - 1))*8;
+                g0[q] = *(const float4 *)(bp);
+                g1[q] = *(const float4 *)(bp + 4);
+            }
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                if (q >= nq) {
+                    continue;
+                }
+                float w[8];
+                w[0] = neg[q] ? -g0[q].x : g0[q].x;
+                w[1] = g0[q].y;
+                w[2] = g0[q].z;
+                w[3] = g0[q].w;
+                w[4] = g1[q].x;
+                w[5] = g1[q].y;
+                w[6] = g1[q].z;
+                w[7] = g1[q].w;
+                const float * uc = u + (cbb + q)*16 + ci;
+                const float   gs = gsc[q];
+                float acc = 0.0f;
+#pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                    acc += __half2float(__float2half_rn(__fmul_rn(w[c], gs)))*uc[c];
+                }
+                part += acc;
+            }
+        }
+
+        {
+            float sred = part;
+            sred += __shfl_xor_sync(0xffffffff, sred, 1);
+            if ((lane & 1) == 0) {
+                red[wid][ri] = sred;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < 16) {
+            float sred = 0.0f;
+#pragma unroll
+            for (int w2i = 0; w2i < n_warps; ++w2i) {
+                sred += red[w2i][threadIdx.x];
+            }
+            scr_p[((int64_t) et*Mb + rb)*16 + threadIdx.x] = sred;
+        }
+        __syncthreads();
+        part = 0.0f;
+    }
+    cluster.sync();
+#else
+    GGML_UNUSED(trellis); GGML_UNUSED(tlut); GGML_UNUSED(gm);
+    GGML_UNUSED(scr_u); GGML_UNUSED(scr_p); GGML_UNUSED(words);
+    GGML_UNUSED(mode); GGML_UNUSED(Mb); GGML_UNUSED(Nb); GGML_UNUSED(gl);
+    GGML_UNUSED(nb); GGML_UNUSED(nt); GGML_UNUSED(depth); GGML_UNUSED(n_tuples);
+#endif
+}
+
+struct mach1_da_lat_entry {
+    uint32_t * packed = nullptr;
+    float      scale  = 0.0f;
+    bool       tried  = false;
+    uint64_t   fp     = 0;
+};
+
+static uint64_t mach1_da_tlut_fp(const uint8_t * head, const uint8_t * tail, size_t ns, size_t nbytes) {
+    uint64_t h = 1469598103934665603ULL ^ (uint64_t) nbytes;
+    for (size_t i = 0; i < ns; ++i) {
+        h = (h ^ head[i])*1099511628211ULL;
+    }
+    for (size_t i = 0; i < ns; ++i) {
+        h = (h ^ tail[i])*1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t mach1_da_tlut_fp_dev(cudaStream_t stream, const ggml_tensor * tlut) {
+    const size_t nbytes = ggml_nbytes(tlut);
+    const size_t ns     = nbytes < 256 ? nbytes : 256;
+    uint8_t head[256], tail[256];
+    CUDA_CHECK(cudaMemcpyAsync(head, (const uint8_t *) tlut->data, ns, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(tail, (const uint8_t *) tlut->data + nbytes - ns, ns, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return mach1_da_tlut_fp(head, tail, ns, nbytes);
+}
+
+static bool mach1_da_lat_on() {
+    static const bool v = mach1_env_int("GGML_MACH1_DA_LATTICE", 1) != 0;
+    return v;
+}
+
+static const mach1_da_lat_entry * mach1_da_get_lattice(ggml_backend_cuda_context & ctx,
+                                                       const ggml_tensor * tlut) {
+    static std::map<const void *, mach1_da_lat_entry> cache;
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto & e = cache[tlut->data];
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap));
+    if (e.tried) {
+        if (cap != cudaStreamCaptureStatusNone) {
+            return &e;
+        }
+        if (e.fp == mach1_da_tlut_fp_dev(ctx.stream(), tlut)) {
+            return &e;
+        }
+        if (e.packed != nullptr) {
+            CUDA_CHECK(cudaFree(e.packed));
+        }
+        e = mach1_da_lat_entry();
+    }
+    if (cap != cudaStreamCaptureStatusNone) {
+        static mach1_da_lat_entry none;
+        return &none;
+    }
+    e.tried = true;
+    e.fp    = mach1_da_tlut_fp_dev(ctx.stream(), tlut);
+    const int64_t rows = ggml_nelements(tlut)/8;
+    if (rows <= 0 || rows > 32768 || ggml_nelements(tlut) % 8 != 0) {
+        return &e;
+    }
+    std::vector<float> h((size_t) rows*8);
+    CUDA_CHECK(cudaMemcpyAsync(h.data(), tlut->data, sizeof(float)*h.size(),
+                               cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    float sc = 0.0f;
+    for (float v : h) {
+        const float a = fabsf(v);
+        if (a > 0.0f && (sc == 0.0f || a < sc)) {
+            sc = a;
+        }
+    }
+    if (sc <= 0.0f) {
+        return &e;
+    }
+    std::vector<uint32_t> pk((size_t) rows);
+    for (int64_t r = 0; r < rows; ++r) {
+        uint32_t w = 0;
+        for (int c = 0; c < 8; ++c) {
+            const float v = h[(size_t) r*8 + c];
+            const int   z = (int) lroundf(v/sc);
+            const float rec = sc*(float) z;
+            if (z < -5 || z > 4 || rec != v) {
+                return &e;
+            }
+            w |= (uint32_t)(z + 5) << (4*c);
+        }
+        pk[r] = w;
+    }
+    CUDA_CHECK(cudaMalloc(&e.packed, sizeof(uint32_t)*pk.size()));
+    CUDA_CHECK(cudaMemcpyAsync(e.packed, pk.data(), sizeof(uint32_t)*pk.size(),
+                               cudaMemcpyHostToDevice, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    e.scale = sc;
+    fprintf(stderr, "mach1: lattice book packed (%lld rows, scale %.9g) - smem walk ENGAGED\n",
+            (long long) rows, (double) sc);
+    return &e;
+}
+
+template <int WG>
+__global__ void mach1_da_walk_lat_kernel(
+        const uint32_t * __restrict__ pbook,
+        const uint16_t * __restrict__ trellis,
+        const half     * __restrict__ gm,
+        const float    * __restrict__ scr_u,
+        float          * __restrict__ scr_p,
+        const float scale, const int rows,
+        const int words, const int mode, const int Mb, const int Nb,
+        const int gl, const int nb, const int nt, const int depth,
+        const int64_t n_tuples) {
+    extern __shared__ uint32_t sm_pk[];
+    float * sm_l16 = (float *)(sm_pk + rows);
+    __shared__ float red[WG/32][16];
+
+    for (int i = threadIdx.x; i < rows; i += WG) {
+        sm_pk[i] = pbook[i];
+    }
+    for (int i = threadIdx.x; i < 16*32; i += WG) {
+        sm_l16[i] = __fmul_rn(scale, (float)(i/32 - 5));
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x % 32;
+    const int wid  = threadIdx.x / 32;
+    const int step = words/2;
+    const int b    = step*lane;
+    const int wi0  = b >> 4;
+    const int o    = b & 15;
+    const int ri   = (8*lane) >> 4;
+    const int ci   = (8*lane) & 15;
+    const float * l16 = sm_l16 + lane;
+
+    for (int64_t tup = blockIdx.x; tup < n_tuples; tup += gridDim.x) {
+        const int et = (int)(tup/Mb);
+        const int rb = (int)(tup % Mb);
+        const int e  = et/nt;
+        const uint16_t * tr = trellis + ((int64_t) e*Mb*Nb)*words;
+        const float    * u  = scr_u + (int64_t) et*nb;
+
+        const int cb0    = wid*depth;
+        const int cb_end = min(cb0 + depth, Nb);
+
+        float part = 0.0f;
+        for (int cbb = cb0; cbb < cb_end; cbb += 4) {
+            const int nq = min(4, cb_end - cbb);
+            float    gsc[4];
+            uint32_t neg[4];
+            uint32_t pk [4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int cb = cbb + (q < nq ? q : 0);
+                const uint16_t * tw = tr + ((int64_t) rb*Nb + cb)*words;
+                const int64_t wv = (rb + cb <= Nb - 1) ? Mb + Nb - 1 - (rb + cb)
+                                                       : Mb + Nb - 2 - (rb + cb);
+                gsc[q] = __half2float(gm[(int64_t) e*gl + wv]);
+                const uint32_t w2  = ((uint32_t) tw[wi0] << 16) |
+                                      (uint32_t) tw[wi0 + 1 < words ? wi0 + 1 : 0];
+                const uint32_t rg  = (w2 >> (16 - o)) & 0xFFFFu;
+                const uint32_t pp  = rg*(rg + 1);
+                const uint32_t row = (mode ? pp >> 1 : pp) & 0x7FFFu;
+                neg[q] = (pp >> (mode ? 16 : 15)) & 1u;
+                pk[q]  = sm_pk[row];
+            }
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                if (q >= nq) {
+                    continue;
+                }
+                const float * uc = u + (cbb + q)*16 + ci;
+                const float4 u0 = *(const float4 *)(uc);
+                const float4 u1 = *(const float4 *)(uc + 4);
+                const float uv[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+                const float   gs = gsc[q];
+                const uint32_t v = pk[q];
+                float acc = 0.0f;
+#pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                    float w = l16[((v >> (4*c)) & 0xFu)*32];
+                    if (c == 0 && neg[q]) {
+                        w = -w;
+                    }
+                    const float ws = __half2float(__float2half_rn(__fmul_rn(w, gs)));
+                    acc += ws*uv[c];
+                }
+                part += acc;
+            }
+        }
+
+        {
+            float sred = part;
+            sred += __shfl_xor_sync(0xffffffff, sred, 1);
+            if ((lane & 1) == 0) {
+                red[wid][ri] = sred;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < 16) {
+            float sred = 0.0f;
+#pragma unroll
+            for (int w2i = 0; w2i < WG/32; ++w2i) {
+                sred += red[w2i][threadIdx.x];
+            }
+            scr_p[((int64_t) et*Mb + rb)*16 + threadIdx.x] = sred;
+        }
+        __syncthreads();
+    }
+}
+
+template <int WG>
+__global__ void mach1_da_redout_kernel(
+        const float * __restrict__ scr_p,
+        const half  * __restrict__ sv,
+        float       * __restrict__ dst,
+        const int Mb, const int nchunks, const int mb, const int m, const int split) {
+    extern __shared__ float da_sh[];
+    float * tmp = da_sh + mb;
+    const int e   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int nt  = gridDim.y;
+    const int et  = e*nt + t;
+    const int tid = threadIdx.x;
+    for (int i = tid; i < mb; i += WG) {
+        const float * pp = scr_p + (((int64_t) et*Mb + (i >> 4))*nchunks)*16 + (i & 15);
+        float sacc = 0.0f;
+        for (int c = 0; c < nchunks; ++c) {
+            sacc += pp[(int64_t) c*16];
+        }
+        da_sh[i] = sacc;
+    }
+    __syncthreads();
+    mach1_da_fwht(da_sh, tmp, mb, tid, WG);
+    float * y = dst + (int64_t) t*m + (split == 2 ? (int64_t) e*mb : 0);
+    for (int i = tid; i < mb; i += WG) {
+        y[i] = __fmul_rn(da_sh[i], __half2float(sv[(int64_t) e*mb + i]));
+    }
+}
+
+static __global__ void mach1_da_walk_reduce_kernel(
+        const float * __restrict__ scr_p,
+        float       * __restrict__ scr_v,
+        const int Mb, const int nchunks, const int64_t total) {
+    const int64_t gid = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (gid >= total) {
+        return;
+    }
+    const int64_t et = gid/((int64_t) Mb*16);
+    const int64_t ri = gid % ((int64_t) Mb*16);
+    const float * p = scr_p + ((int64_t) et*Mb + ri/16)*nchunks*16 + (ri & 15);
+    float s = 0.0f;
+    for (int c = 0; c < nchunks; ++c) {
+        s += p[(int64_t) c*16];
+    }
+    scr_v[gid] = s;
+}
+
+template <int WG>
+__global__ void mach1_da_out_kernel(
+        const float * __restrict__ scr_v,
+        const half  * __restrict__ sv,
+        float       * __restrict__ dst,
+        const int mb, const int m, const int split) {
+    extern __shared__ float da_sh[];
+    float * tmp = da_sh + mb;
+    const int e   = blockIdx.x;
+    const int t   = blockIdx.y;
+    const int nt  = gridDim.y;
+    const int tid = threadIdx.x;
+    const float * v = scr_v + ((int64_t) e*nt + t)*mb;
+    for (int i = tid; i < mb; i += WG) {
+        da_sh[i] = v[i];
+    }
+    __syncthreads();
+    mach1_da_fwht(da_sh, tmp, mb, tid, WG);
+    float * y = dst + (int64_t) t*m + (split == 2 ? (int64_t) e*mb : 0);
+    for (int i = tid; i < mb; i += WG) {
+        y[i] = __fmul_rn(da_sh[i], __half2float(sv[(int64_t) e*mb + i]));
+    }
+}
+
+static __global__ void mach1_da_out_sum_kernel(
+        const float * __restrict__ scr_y,
+        float       * __restrict__ dst,
+        const int mb, const int E, const int64_t total) {
+    const int64_t gid = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (gid >= total) {
+        return;
+    }
+    const int64_t t = gid/mb;
+    const int64_t i = gid % mb;
+    float s = 0.0f;
+    for (int e = 0; e < E; ++e) {
+        s += scr_y[((int64_t) t*E + e)*mb + i];
+    }
+    dst[gid] = s;
+}
+
+static int mach1_da_fuse_nt() {
+    static const int v = mach1_env_int("GGML_MACH1_DA_FUSE_NT", 16);
+    return v;
+}
+
+static int mach1_da_probe() {
+    static const int v = mach1_env_int("GGML_MACH1_DA_PROBE", 0) & 3;
+    return v;
+}
+
+static bool mach1_da_lut16_on() {
+    static bool warned = false;
+    static const bool want = mach1_env_int("GGML_MACH1_DA_LUT16", 0) != 0;
+    if (want && !warned) {
+        warned = true;
+        fprintf(stderr, "mach1: DA_LUT16 ON - book pre-rounded to fp16, decode is NOT bit-exact (probe only)\n");
+    }
+    return want;
+}
+
+static __global__ void mach1_da_u_half_kernel(const float * __restrict__ u,
+                                              half * __restrict__ uh, const int64_t total) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < total) {
+        uh[i] = __float2half_rn(u[i]);
+    }
+}
+
+static bool mach1_da_gemm_on() {
+    static const bool v = mach1_env_int("GGML_MACH1_DA_GEMM", 1) != 0;
+    return v;
+}
+
+static const half * mach1_da_get_lut16(ggml_backend_cuda_context & ctx, const ggml_tensor * tlut) {
+    if (!mach1_da_lut16_on()) {
+        return nullptr;
+    }
+    static std::map<const void *, half *> cache;
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = cache.find(tlut->data);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap));
+    if (cap != cudaStreamCaptureStatusNone) {
+        return nullptr;
+    }
+    const int64_t total = ggml_nelements(tlut);
+    half * d = nullptr;
+    CUDA_CHECK(cudaMalloc(&d, sizeof(half)*(size_t) total));
+    mach1_launch(mach1_da_u_half_kernel,
+        ggml_cuda_kernel_launch_params(dim3((unsigned)((total + 255)/256), 1, 1), dim3(256, 1, 1), 0, ctx.stream()),
+        (const float *) tlut->data, d, total);
+    cache[tlut->data] = d;
+    return d;
+}
+
+static int mach1_da_fwht_wg(const int64_t d) {
+    static const int fixed = mach1_env_int("GGML_MACH1_DA_FWHT_WG", 0);
+    if (fixed == 256 || fixed == 512 || fixed == 1024) {
+        return fixed;
+    }
+    return d >= 1024 ? 512 : 256;
+}
+
+template <int W>
+static void mach1_da_u_go(ggml_backend_cuda_context & ctx, int64_t E, int64_t nt, size_t smem,
+                          const float * x, const half * su, float * u, int n, int nb, int split) {
+    if (smem > 48*1024) {
+        mach1_smem_opt_in((const void *) mach1_da_u_kernel<W>, smem);
+    }
+    mach1_launch(mach1_da_u_kernel<W>,
+        ggml_cuda_kernel_launch_params(dim3((unsigned) E, (unsigned) nt, 1), dim3(W, 1, 1), smem, ctx.stream()),
+        x, su, u, n, nb, split);
+}
+
+static void mach1_da_u_stage(ggml_backend_cuda_context & ctx, int64_t E, int64_t nt, int64_t nb,
+                             const float * x, const half * su, float * u, int n, int split) {
+    const size_t smem = mach1_da_smem(nb);
+    switch (mach1_da_fwht_wg(nb)) {
+        case 1024: mach1_da_u_go<1024>(ctx, E, nt, smem, x, su, u, n, (int) nb, split); break;
+        case 512:  mach1_da_u_go<512> (ctx, E, nt, smem, x, su, u, n, (int) nb, split); break;
+        default:   mach1_da_u_go<256> (ctx, E, nt, smem, x, su, u, n, (int) nb, split); break;
+    }
+}
+
+template <int W>
+static void mach1_da_out_go(ggml_backend_cuda_context & ctx, int64_t E, int64_t nt, size_t smem,
+                            const float * v, const half * sv, float * y, int mb, int m, int split) {
+    if (smem > 48*1024) {
+        mach1_smem_opt_in((const void *) mach1_da_out_kernel<W>, smem);
+    }
+    mach1_launch(mach1_da_out_kernel<W>,
+        ggml_cuda_kernel_launch_params(dim3((unsigned) E, (unsigned) nt, 1), dim3(W, 1, 1), smem, ctx.stream()),
+        v, sv, y, mb, m, split);
+}
+
+static void mach1_da_out_stage(ggml_backend_cuda_context & ctx, int64_t E, int64_t nt, int64_t mb,
+                               const float * v, const half * sv, float * y, int m, int split) {
+    const size_t smem = mach1_da_smem(mb);
+    switch (mach1_da_fwht_wg(mb)) {
+        case 1024: mach1_da_out_go<1024>(ctx, E, nt, smem, v, sv, y, (int) mb, m, split); break;
+        case 512:  mach1_da_out_go<512> (ctx, E, nt, smem, v, sv, y, (int) mb, m, split); break;
+        default:   mach1_da_out_go<256> (ctx, E, nt, smem, v, sv, y, (int) mb, m, split); break;
+    }
+}
+
+static int mach1_da_walk_tpw(int64_t Mb, int64_t Nb, int64_t Ent) {
+    static const int fixed = mach1_env_int("GGML_MACH1_DA_TPW", 0);
+    if (fixed == 1 || fixed == 2 || fixed == 4) {
+        return fixed;
+    }
+    for (int tpw = 4; tpw > 1; tpw >>= 1) {
+        const int64_t nchunks = (Nb + 8*tpw - 1)/(8*tpw);
+        if (Mb*nchunks*Ent >= 1024) {
+            return tpw;
+        }
+    }
+    return 1;
+}
+
+template <int WG>
+static void mach1_da_walk_lat_launch(ggml_backend_cuda_context & ctx,
+        const mach1_da_lat_entry * lat, int rows,
+        const uint16_t * tr, const half * gm, const float * u, float * p,
+        int words, int mode, int Mb, int Nb, int gl, int nb, int nt,
+        int depth, int64_t n_tuples) {
+    const size_t smem = sizeof(uint32_t)*(size_t) rows + sizeof(float)*16*32;
+    mach1_smem_opt_in((const void *) mach1_da_walk_lat_kernel<WG>, smem);
+    const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    const int64_t want = (n_tuples + (WG/32) - 1)/(WG/32);
+    const unsigned nblk = (unsigned) std::min<int64_t>(std::max<int64_t>(nsm, want), (int64_t) 4*nsm);
+    mach1_launch(mach1_da_walk_lat_kernel<WG>,
+        ggml_cuda_kernel_launch_params(dim3(nblk, 1, 1), dim3(WG, 1, 1), smem, ctx.stream()),
+        lat->packed, tr, gm, u, p, lat->scale, rows,
+        words, mode, Mb, Nb, gl, nb, nt, depth, n_tuples);
+}
+
+static bool mach1_da_dsm_on(int cc) {
+    static const bool env = mach1_env_int("GGML_MACH1_DA_DSM", 0) != 0;
+    return env && cc >= GGML_CUDA_CC_HOPPER;
+}
+
+template <int WG>
+static void mach1_da_walk_dsm_launch(ggml_backend_cuda_context & ctx,
+        const uint16_t * tr, const float * tlut, const half * gm,
+        const float * u, float * p,
+        int words, int mode, int Mb, int Nb, int gl, int nb, int nt,
+        int depth, int64_t n_tuples) {
+    constexpr size_t smem = sizeof(float)*MACH1_DA_DSM_ROWS*8;
+    mach1_smem_opt_in((const void *) mach1_da_walk_dsm_kernel<WG>, smem);
+    const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    const unsigned nblk = (unsigned) std::max(MACH1_DA_DSM_CLUSTER,
+        (nsm/MACH1_DA_DSM_CLUSTER)*MACH1_DA_DSM_CLUSTER);
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim          = dim3(nblk, 1, 1);
+    cfg.blockDim         = dim3(WG, 1, 1);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream           = ctx.stream();
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = MACH1_DA_DSM_CLUSTER;
+    attrs[0].val.clusterDim.y = 1;
+    attrs[0].val.clusterDim.z = 1;
+    cfg.attrs    = attrs;
+    cfg.numAttrs = 1;
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, mach1_da_walk_dsm_kernel<WG>,
+        tr, tlut, gm, u, p, words, mode, Mb, Nb, gl, nb, nt, depth, n_tuples));
+}
+
+static bool mach1_da_deep_on() {
+    static const bool v = mach1_env_int("GGML_MACH1_DA_DEEP", 1) != 0;
+    return v;
+}
+static int mach1_da_deep_depth(int Nb) {
+    static const int pin = mach1_env_int("GGML_MACH1_DA_DEPTH", 0);
+    const int cover = (Nb + 7)/8;
+    const int d = pin > 0 ? pin : 48;
+    return d < cover ? d : cover;
+}
+
+template <int WG>
+static void mach1_da_walk_deep_launch(ggml_backend_cuda_context & ctx, const dim3 & grid, size_t smem,
+        const uint16_t * tr, const float * tlut, const half * tlut16, const half * gm,
+        const float * u, float * p,
+        int words, int mode, int Mb, int Nb, int gl, int nb, int nt, int nchunks, int depth) {
+    const ggml_cuda_kernel_launch_params lp =
+        ggml_cuda_kernel_launch_params(grid, dim3(WG, 1, 1), smem, ctx.stream());
+#define MACH1_DA_WD(P, L)                                                    \
+    mach1_launch((mach1_da_walk_deep_kernel<WG, P, L>), lp,                  \
+                 tr, tlut, tlut16, gm, u, p,                                 \
+                 words, mode, Mb, Nb, gl, nb, nt, nchunks, depth)
+    const int probe = mach1_da_probe();
+    if (probe == 0 && tlut16 != nullptr) {
+        MACH1_DA_WD(0, true);
+        return;
+    }
+    switch (probe) {
+        case 1:  MACH1_DA_WD(1, false); break;
+        case 2:  MACH1_DA_WD(2, false); break;
+        case 3:  MACH1_DA_WD(3, false); break;
+        default: MACH1_DA_WD(0, false); break;
+    }
+#undef MACH1_DA_WD
+}
+
+template <int WG>
+static void mach1_da_walk_tiles_launch(ggml_backend_cuda_context & ctx, const dim3 & grid, int tpw,
+        const uint16_t * tr, const float * tlut, const half * tlut16, const half * gm,
+        const float * u, float * p,
+        int words, int mode, int Mb, int Nb, int gl, int nb, int nt, int nchunks) {
+    const ggml_cuda_kernel_launch_params lp =
+        ggml_cuda_kernel_launch_params(grid, dim3(WG, 1, 1), 0, ctx.stream());
+#define MACH1_DA_WT1(T, P, L)                                                \
+    mach1_launch((mach1_da_walk_tiles_kernel<WG, T, P, L>), lp,              \
+                 tr, tlut, tlut16, gm, u, p,                                 \
+                 words, mode, Mb, Nb, gl, nb, nt, nchunks)
+#define MACH1_DA_WT(P, L)                                                    \
+    do {                                                                     \
+        switch (tpw) {                                                       \
+            case 1:  MACH1_DA_WT1(1, P, L); break;                           \
+            case 2:  MACH1_DA_WT1(2, P, L); break;                           \
+            default: MACH1_DA_WT1(4, P, L); break;                           \
+        }                                                                    \
+    } while (0)
+    const int probe = mach1_da_probe();
+    if (probe == 0 && tlut16 != nullptr) {
+        MACH1_DA_WT(0, true);
+        return;
+    }
+    switch (probe) {
+        case 1:  MACH1_DA_WT(1, false); break;
+        case 2:  MACH1_DA_WT(2, false); break;
+        case 3:  MACH1_DA_WT(3, false); break;
+        default: MACH1_DA_WT(0, false); break;
+    }
+#undef MACH1_DA_WT
+#undef MACH1_DA_WT1
+}
+
+template <int WG>
+static void mach1_da_redout_go(ggml_backend_cuda_context & ctx, int64_t E, int64_t nt, size_t smem,
+        const float * scr_p, const half * sv, float * y,
+        int Mb, int nchunks, int mb, int m, int split) {
+    if (smem > 48*1024) {
+        mach1_smem_opt_in((const void *) mach1_da_redout_kernel<WG>, smem);
+    }
+    mach1_launch(mach1_da_redout_kernel<WG>,
+        ggml_cuda_kernel_launch_params(dim3((unsigned) E, (unsigned) nt, 1), dim3(WG, 1, 1), smem, ctx.stream()),
+        scr_p, sv, y, Mb, nchunks, mb, m, split);
+}
+
+static void mach1_da_redout_stage(ggml_backend_cuda_context & ctx, int64_t E, int64_t nt,
+        const float * scr_p, const half * sv, float * y,
+        int Mb, int nchunks, int64_t mb, int m, int split) {
+    const size_t smem = mach1_da_smem(mb);
+    switch (mach1_da_fwht_wg(mb)) {
+        case 1024: mach1_da_redout_go<1024>(ctx, E, nt, smem, scr_p, sv, y, Mb, nchunks, (int) mb, m, split); break;
+        case 512:  mach1_da_redout_go<512> (ctx, E, nt, smem, scr_p, sv, y, Mb, nchunks, (int) mb, m, split); break;
+        default:   mach1_da_redout_go<256> (ctx, E, nt, smem, scr_p, sv, y, Mb, nchunks, (int) mb, m, split); break;
+    }
+}
+
+void ggml_cuda_op_mach1_da_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * trellis  = dst->src[0];
+    const ggml_tensor * su       = dst->src[1];
+    const ggml_tensor * sv       = dst->src[2];
+    const ggml_tensor * wgamma   = dst->src[3];
+    const ggml_tensor * tlut     = dst->src[4];
+    const ggml_tensor * x        = dst->src[5];
+    const ggml_tensor * exc_idx  = dst->src[6];
+    const ggml_tensor * exc_rows = dst->src[7];
+
+    const int mode  = ggml_get_op_params_i32(dst, 0);
+    const int split = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t nb    = su->ne[0];
+    const int64_t mb    = sv->ne[0];
+    const int64_t E     = trellis->ne[2];
+    const int64_t words = trellis->ne[0];
+    const int64_t tiles = trellis->ne[1];
+    const int64_t gl    = wgamma->ne[0];
+    const int64_t n     = x->ne[0];
+    const int64_t m     = dst->ne[0];
+    const int64_t nt    = x->ne[1]*x->ne[2]*x->ne[3];
+
+    constexpr int WG = 256;
+
+    if (nt <= 4) {
+        const int Mb = (int)(mb/16), Nb = (int)(nb/16);
+        const bool deep = mach1_da_deep_on();
+        const int depth = mach1_da_deep_depth(Nb);
+        const int tpw = mach1_da_walk_tpw(Mb, Nb, E*nt);
+        const int nchunks = deep ? (Nb + (WG/32)*depth - 1)/((WG/32)*depth)
+                                 : (Nb + (WG/32)*tpw - 1)/((WG/32)*tpw);
+        ggml_cuda_pool_alloc<float> scr_u(ctx.pool(), (size_t)(E*nt*nb));
+        ggml_cuda_pool_alloc<float> scr_p(ctx.pool(), (size_t)(E*nt)*Mb*nchunks*16);
+        const half * tlut16 = mach1_da_get_lut16(ctx, tlut);
+        const dim3 wgrid((unsigned) Mb, (unsigned) nchunks, (unsigned)(E*nt));
+        mach1_timed(ctx.stream(), "da_u", [&] {
+            mach1_da_u_stage(ctx, E, nt, nb, (const float *) x->data,
+                             (const half *) su->data, scr_u.get(), (int) n, split); });
+        const mach1_da_lat_entry * lat = nullptr;
+        if (tlut16 == nullptr && mach1_da_probe() == 0 && mach1_da_lat_on()) {
+            const int rows = (int)(ggml_nelements(tlut)/8);
+            const size_t lsmem = sizeof(uint32_t)*(size_t) rows + sizeof(float)*16*32 + 4096;
+            if (ggml_cuda_info().devices[ctx.device].smpbo >= lsmem) {
+                const mach1_da_lat_entry * cand = mach1_da_get_lattice(ctx, tlut);
+                if (cand->packed != nullptr) {
+                    lat = cand;
+                }
+            }
+        }
+        if (lat != nullptr) {
+            const int rows   = (int)(ggml_nelements(tlut)/8);
+            const int ldepth = (Nb + 16 - 1)/16;
+            ggml_cuda_pool_alloc<float> scr_pl(ctx.pool(), (size_t)(E*nt)*Mb*16);
+            mach1_timed(ctx.stream(), "da_walkl", [&] { mach1_da_walk_lat_launch<512>(ctx, lat, rows,
+                    (const uint16_t *) trellis->data, (const half *) wgamma->data,
+                    scr_u.get(), scr_pl.get(),
+                    (int) words, mode, Mb, Nb, (int) gl, (int) nb, (int) nt,
+                    ldepth, (int64_t) E*nt*Mb); });
+            if (split == 1) {
+                ggml_cuda_pool_alloc<float> scr_y(ctx.pool(), (size_t)(nt*E*mb));
+                mach1_timed(ctx.stream(), "da_redout", [&] {
+                    mach1_da_redout_stage(ctx, E, nt, scr_pl.get(), (const half *) sv->data,
+                                          scr_y.get(), Mb, 1, mb, (int)(E*mb), 2); });
+                const int64_t total = nt*mb;
+                mach1_timed(ctx.stream(), "da_outsum", [&] { mach1_launch(mach1_da_out_sum_kernel,
+                        ggml_cuda_kernel_launch_params(dim3((unsigned)((total + WG - 1)/WG), 1, 1), dim3(WG, 1, 1), 0, ctx.stream()),
+                        scr_y.get(), (float *) dst->data, (int) mb, (int) E, total); });
+            } else {
+                mach1_timed(ctx.stream(), "da_redout", [&] {
+                    mach1_da_redout_stage(ctx, E, nt, scr_pl.get(), (const half *) sv->data,
+                                          (float *) dst->data, Mb, 1, mb, (int) m, split); });
+            }
+            if (exc_idx != nullptr) {
+                const int exc_base = ggml_get_op_params_i32(dst, 2);
+                const int n_exc    = (int) exc_idx->ne[0];
+                const dim3 egrid((unsigned)(((int64_t) n_exc*nt*32 + WG - 1)/WG), 1, 1);
+                mach1_timed(ctx.stream(), "da_exc", [&] { mach1_launch(mach1_da_exc_kernel,
+                        ggml_cuda_kernel_launch_params(egrid, dim3(WG, 1, 1), 0, ctx.stream()),
+                        (const int32_t  *) exc_idx->data,
+                        (const uint16_t *) exc_rows->data,
+                        (const float    *) x->data, (float *) dst->data,
+                        (int) n, (int) m, (int) nt, n_exc, exc_base); });
+            }
+            return;
+        }
+        const bool dsm = nchunks == 1 && tlut16 == nullptr && mach1_da_probe() == 0 &&
+                         mach1_da_dsm_on(ggml_cuda_info().devices[ctx.device].cc);
+        if (dsm) {
+            const int ddepth = (Nb + 16 - 1)/16;
+            mach1_timed(ctx.stream(), "da_walkc", [&] { mach1_da_walk_dsm_launch<512>(ctx,
+                    (const uint16_t *) trellis->data, (const float *) tlut->data,
+                    (const half *) wgamma->data, scr_u.get(), scr_p.get(),
+                    (int) words, mode, Mb, Nb, (int) gl, (int) nb, (int) nt,
+                    ddepth, (int64_t) E*nt*Mb); });
+        } else if (deep) {
+            const size_t dsmem = sizeof(float)*(size_t) std::min((int64_t)(WG/32)*depth*16, (int64_t) Nb*16);
+            mach1_timed(ctx.stream(), "da_walkd", [&] { mach1_da_walk_deep_launch<WG>(ctx, wgrid, dsmem,
+                    (const uint16_t *) trellis->data, (const float *) tlut->data, tlut16,
+                    (const half *) wgamma->data, scr_u.get(), scr_p.get(),
+                    (int) words, mode, Mb, Nb, (int) gl, (int) nb, (int) nt, nchunks, depth); });
+        } else {
+            mach1_timed(ctx.stream(), "da_walk2", [&] { mach1_da_walk_tiles_launch<WG>(ctx, wgrid, tpw,
+                    (const uint16_t *) trellis->data, (const float *) tlut->data, tlut16,
+                    (const half *) wgamma->data, scr_u.get(), scr_p.get(),
+                    (int) words, mode, Mb, Nb, (int) gl, (int) nb, (int) nt, nchunks); });
+        }
+        if (split == 1) {
+            ggml_cuda_pool_alloc<float> scr_y(ctx.pool(), (size_t)(nt*E*mb));
+            mach1_timed(ctx.stream(), "da_redout", [&] {
+                mach1_da_redout_stage(ctx, E, nt, scr_p.get(), (const half *) sv->data,
+                                      scr_y.get(), Mb, nchunks, mb, (int)(E*mb), 2); });
+            const int64_t total = nt*mb;
+            mach1_timed(ctx.stream(), "da_outsum", [&] { mach1_launch(mach1_da_out_sum_kernel,
+                    ggml_cuda_kernel_launch_params(dim3((unsigned)((total + WG - 1)/WG), 1, 1), dim3(WG, 1, 1), 0, ctx.stream()),
+                    scr_y.get(), (float *) dst->data, (int) mb, (int) E, total); });
+        } else {
+            mach1_timed(ctx.stream(), "da_redout", [&] {
+                mach1_da_redout_stage(ctx, E, nt, scr_p.get(), (const half *) sv->data,
+                                      (float *) dst->data, Mb, nchunks, mb, (int) m, split); });
+        }
+    } else if (nt <= mach1_da_fuse_nt()) {
+        ggml_cuda_pool_alloc<float> scr_u(ctx.pool(), (size_t)(E*nt*nb));
+        ggml_cuda_pool_alloc<float> scr_v(ctx.pool(), (size_t)(E*nt*mb));
+        mach1_timed(ctx.stream(), "da_u", [&] {
+            mach1_da_u_stage(ctx, E, nt, nb, (const float *) x->data,
+                             (const half *) su->data, scr_u.get(), (int) n, split); });
+        mach1_timed(ctx.stream(), "da_walk1", [&] { mach1_launch(mach1_da_walk_kernel<WG>,
+                ggml_cuda_kernel_launch_params(dim3((unsigned)(mb/16), (unsigned) E, (unsigned) nt), dim3(WG, 1, 1), 0, ctx.stream()),
+                (const uint16_t *) trellis->data, (const float *) tlut->data,
+                (const half *) wgamma->data, scr_u.get(), scr_v.get(),
+                (int) words, mode, (int)(mb/16), (int)(nb/16), (int) gl, (int) nb); });
+        if (split == 1) {
+            ggml_cuda_pool_alloc<float> scr_y(ctx.pool(), (size_t)(nt*E*mb));
+            mach1_timed(ctx.stream(), "da_out", [&] {
+                mach1_da_out_stage(ctx, E, nt, mb, scr_v.get(), (const half *) sv->data,
+                                   scr_y.get(), (int)(E*mb), 2); });
+            const int64_t total = nt*mb;
+            mach1_timed(ctx.stream(), "da_outsum", [&] { mach1_launch(mach1_da_out_sum_kernel,
+                    ggml_cuda_kernel_launch_params(dim3((unsigned)((total + WG - 1)/WG), 1, 1), dim3(WG, 1, 1), 0, ctx.stream()),
+                    scr_y.get(), (float *) dst->data, (int) mb, (int) E, total); });
+        } else {
+            mach1_timed(ctx.stream(), "da_out", [&] {
+                mach1_da_out_stage(ctx, E, nt, mb, scr_v.get(), (const half *) sv->data,
+                                   (float *) dst->data, (int) m, split); });
+        }
+    } else {
+        ggml_cuda_pool_alloc<float> wbuf(ctx.pool(), (size_t)(mb*nb));
+
+        const bool use_gemm = mach1_da_gemm_on();
+        if (use_gemm) {
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), ctx.stream()));
+        }
+        for (int64_t e = 0; e < E; ++e) {
+            mach1_da_decode_block_cuda(ctx,
+                (const uint16_t *) trellis->data + e*tiles*words,
+                (const float *) tlut->data,
+                (const half *) su->data + e*nb,
+                (const half *) sv->data + e*mb,
+                (const half *) wgamma->data + e*gl,
+                (int) words, mode, mb, nb, wbuf.get(), nullptr, 0);
+
+            if (use_gemm) {
+                const float alpha = 1.0f;
+                const float beta  = (split == 1 && e > 0) ? 1.0f : 0.0f;
+                mach1_timed(ctx.stream(), "da_gemm", [&] {
+                    CUBLAS_CHECK(cublasSgemm(ctx.cublas_handle(),
+                        CUBLAS_OP_T, CUBLAS_OP_N,
+                        (int) mb, (int) nt, (int) nb,
+                        &alpha,
+                        wbuf.get(), (int) nb,
+                        (const float *) x->data + (split == 1 ? e*nb : 0), (int) n,
+                        &beta,
+                        (float *) dst->data + (split == 2 ? e*mb : 0), (int) m)); });
+            } else {
+                const int64_t warps = mb*nt;
+                const dim3 grid((unsigned)((warps*32 + WG - 1)/WG), 1, 1);
+                mach1_timed(ctx.stream(), "da_apply", [&] { mach1_launch(mach1_da_apply_kernel,
+                        ggml_cuda_kernel_launch_params(grid, dim3(WG, 1, 1), 0, ctx.stream()),
+                        wbuf.get(), (const float *) x->data, (float *) dst->data,
+                        (int) mb, (int) nb, (int) n, (int) m, (int) nt,
+                        split == 1 ? e*nb : 0, split == 2 ? e*mb : 0,
+                        split == 1 && e > 0 ? 1 : 0); });
+            }
+        }
+    }
+
+    if (exc_idx != nullptr) {
+        const int exc_base = ggml_get_op_params_i32(dst, 2);
+        const int n_exc    = (int) exc_idx->ne[0];
+        const dim3 grid((unsigned)(((int64_t) n_exc*nt*32 + WG - 1)/WG), 1, 1);
+        mach1_timed(ctx.stream(), "da_exc", [&] { mach1_launch(mach1_da_exc_kernel,
+                ggml_cuda_kernel_launch_params(grid, dim3(WG, 1, 1), 0, ctx.stream()),
+                (const int32_t  *) exc_idx->data,
+                (const uint16_t *) exc_rows->data,
+                (const float    *) x->data, (float *) dst->data,
+                (int) n, (int) m, (int) nt, n_exc, exc_base); });
+    }
+}
+
+template <int WG>
+__global__ void mach1_int_mm_kernel(
+        const uint8_t * __restrict__ q,
+        const half    * __restrict__ mn,
+        const half    * __restrict__ mx,
+        const float   * __restrict__ x,
+        float         * __restrict__ dst,
+        const int bits, const int n, const int m, const int nt, const int ngr, const int grp) {
+    __shared__ float red[WG/32];
+    const int r   = blockIdx.x;
+    const int tok = blockIdx.y;
+    const int tid = threadIdx.x;
+    const uint8_t * qrow = q + (int64_t) r*(n*bits/8);
+    const float   * xc   = x + (int64_t) tok*n;
+    const float denom = (float)((1 << bits) - 1);
+    const uint32_t msk = (1u << bits) - 1;
+    const int nslots = n/8;
+
+    float acc = 0.0f;
+    for (int slot = tid; slot < nslots; slot += WG) {
+        const int j0 = slot*8;
+        const int g = j0/grp;
+        const float mnf = __half2float(mn[(int64_t) r*ngr + g]);
+        const float d   = __fsub_rn(__half2float(mx[(int64_t) r*ngr + g]), mnf);
+        const float sc  = __fdiv_rn(d > 1e-8f ? d : 1e-8f, denom);
+        const uint8_t * bp = qrow + (j0*bits >> 3);
+        uint32_t w;
+        if (bits == 4) {
+            w = *(const uint32_t *)(bp);
+        } else {
+            w = (uint32_t) bp[0] | ((uint32_t) bp[1] << 8) | ((uint32_t) bp[2] << 16);
+        }
+        const float4 x0 = *(const float4 *)(xc + j0);
+        const float4 x1 = *(const float4 *)(xc + j0 + 4);
+        const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            const int bpos = (j0 + c)*bits - ((j0*bits >> 3) << 3);
+            uint32_t qv;
+            if (bits == 4) {
+                const int  by  = bpos >> 3;
+                const int  off = bpos & 7;
+                const uint32_t byv = (w >> (8*by)) & 0xFFu;
+                qv = (byv >> (8 - off - bits)) & msk;
+            } else {
+                const int  by  = bpos >> 3;
+                const int  off = bpos & 7;
+                uint32_t byv = (w >> (8*by)) & 0xFFu;
+                if (off + bits > 8) {
+                    const uint32_t nx = (w >> (8*(by + 1))) & 0xFFu;
+                    qv = (((byv << 8) | nx) >> (16 - off - bits)) & msk;
+                } else {
+                    qv = (byv >> (8 - off - bits)) & msk;
+                }
+            }
+            const float pr = __fmul_rn((float) qv, sc);
+            const float wv = __fadd_rn(mnf, pr);
+            acc += wv*xv[c];
+        }
+    }
+
+    const int lane = tid % 32;
+    const int wid  = tid / 32;
+#pragma unroll
+    for (int sh = 16; sh > 0; sh >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, sh);
+    }
+    if (lane == 0) {
+        red[wid] = acc;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w2 = 0; w2 < WG/32; ++w2) {
+            s += red[w2];
+        }
+        dst[(int64_t) tok*m + r] = s;
+    }
+}
+
+void ggml_cuda_op_mach1_int_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q  = dst->src[0];
+    const ggml_tensor * mn = dst->src[1];
+    const ggml_tensor * mx = dst->src[2];
+    const ggml_tensor * x  = dst->src[3];
+
+    const int bits = ggml_get_op_params_i32(dst, 0);
+
+    const int n   = (int) x->ne[0];
+    const int m   = (int) q->ne[1];
+    const int ngr = (int) mn->ne[0];
+    const int nt  = (int)(x->ne[1]*x->ne[2]*x->ne[3]);
+
+    constexpr int WG = 256;
+    const dim3 grid((unsigned) m, (unsigned) nt, 1);
+
+    mach1_timed(ctx.stream(), "int_mm", [&] { mach1_launch(mach1_int_mm_kernel<WG>,
+            ggml_cuda_kernel_launch_params(grid, dim3(WG, 1, 1), 0, ctx.stream()),
+            (const uint8_t *) q->data,
+            (const half    *) mn->data,
+            (const half    *) mx->data,
+            (const float   *) x->data,
+            (float         *) dst->data,
+            bits, n, m, nt, ngr, n/ngr); });
+}
+
+static __global__ void mach1_da_embed_mask_kernel(
+        const int32_t * __restrict__ ids,
+        int32_t       * __restrict__ mask,
+        const int nt, const int mb, const int E) {
+    const int tid = threadIdx.x;
+    for (int e = tid; e < E; e += blockDim.x) {
+        mask[e] = 0;
+    }
+    __syncthreads();
+    for (int t = tid; t < nt; t += blockDim.x) {
+        mask[ids[t]/mb] = 1;
+    }
+}
+
+static __global__ void mach1_da_embed_copy_kernel(
+        const float   * __restrict__ wbuf,
+        const int32_t * __restrict__ ids,
+        float         * __restrict__ dst,
+        const int64_t e, const int mb, const int nb, const int nt) {
+    const int64_t gid = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (gid >= (int64_t) nt*nb) {
+        return;
+    }
+    const int64_t tok = gid / nb;
+    const int64_t j   = gid % nb;
+    const int64_t r   = ids[tok];
+    if (r/mb != e) {
+        return;
+    }
+    dst[tok*nb + j] = wbuf[(r - e*mb)*nb + j];
+}
+
+void ggml_cuda_op_mach1_da_embed(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * trellis = dst->src[0];
+    const ggml_tensor * su      = dst->src[1];
+    const ggml_tensor * sv      = dst->src[2];
+    const ggml_tensor * wgamma  = dst->src[3];
+    const ggml_tensor * tlut    = dst->src[4];
+    const ggml_tensor * ids     = dst->src[5];
+
+    const int mode = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t nb    = su->ne[0];
+    const int64_t mb    = sv->ne[0];
+    const int64_t E     = trellis->ne[2];
+    const int64_t words = trellis->ne[0];
+    const int64_t tiles = trellis->ne[1];
+    const int64_t gl    = wgamma->ne[0];
+    const int64_t nt    = ids->ne[0];
+
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap));
+
+    ggml_cuda_pool_alloc<float> wbuf(ctx.pool(), (size_t)(mb*nb));
+
+    constexpr int WG = 256;
+
+    if (cap != cudaStreamCaptureStatusNone) {
+        ggml_cuda_pool_alloc<int32_t> mask(ctx.pool(), (size_t) E);
+        mach1_launch(mach1_da_embed_mask_kernel,
+            ggml_cuda_kernel_launch_params(dim3(1, 1, 1), dim3(WG, 1, 1), 0, ctx.stream()),
+            (const int32_t *) ids->data, mask.get(), (int) nt, (int) mb, (int) E);
+        for (int64_t e = 0; e < E; ++e) {
+            mach1_da_decode_block_cuda(ctx,
+                (const uint16_t *) trellis->data + e*tiles*words,
+                (const float *) tlut->data,
+                (const half *) su->data + e*nb,
+                (const half *) sv->data + e*mb,
+                (const half *) wgamma->data + e*gl,
+                (int) words, mode, mb, nb, wbuf.get(), mask.get(), (int) e);
+
+            const dim3 grid((unsigned)((nt*nb + WG - 1)/WG), 1, 1);
+            mach1_launch(mach1_da_embed_copy_kernel,
+                ggml_cuda_kernel_launch_params(grid, dim3(WG, 1, 1), 0, ctx.stream()),
+                wbuf.get(), (const int32_t *) ids->data, (float *) dst->data,
+                e, (int) mb, (int) nb, (int) nt);
+        }
+        return;
+    }
+
+    std::vector<int32_t> h_ids(nt);
+    CUDA_CHECK(cudaMemcpyAsync(h_ids.data(), ids->data, nt*sizeof(int32_t),
+                               cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+    std::vector<uint8_t> used((size_t) E, 0);
+    for (int64_t t = 0; t < nt; ++t) {
+        GGML_ASSERT(h_ids[t] >= 0 && h_ids[t] < E*mb);
+        used[h_ids[t]/mb] = 1;
+    }
+
+    for (int64_t e = 0; e < E; ++e) {
+        if (!used[e]) {
+            continue;
+        }
+        mach1_da_decode_block_cuda(ctx,
+            (const uint16_t *) trellis->data + e*tiles*words,
+            (const float *) tlut->data,
+            (const half *) su->data + e*nb,
+            (const half *) sv->data + e*mb,
+            (const half *) wgamma->data + e*gl,
+            (int) words, mode, mb, nb, wbuf.get(), nullptr, 0);
+
+        const dim3 grid((unsigned)((nt*nb + WG - 1)/WG), 1, 1);
+        mach1_launch(mach1_da_embed_copy_kernel,
+            ggml_cuda_kernel_launch_params(grid, dim3(WG, 1, 1), 0, ctx.stream()),
+            wbuf.get(), (const int32_t *) ids->data, (float *) dst->data,
+            e, (int) mb, (int) nb, (int) nt);
+    }
+}
+
 bool ggml_cuda_mach1_supported(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_MACH1_EXP_MM:
-            // walk/out kernels stage u and H(v) in fixed shared arrays of 2048
-            // floats; the group kernel keeps per-group tables in shared arrays
-            // of 512; V=8 (payload v3) requires wave_gamma and vice versa. The
-            // two walk variants also fix the tlut storage type: V=8 reads the
-            // pre-rounded F16 table, V=2 the F32 one.
             return op->src[2]->ne[0] <= 2048 && op->src[3]->ne[0] <= 2048 &&
                    op->src[0]->ne[2] + (op->src[1] ? op->src[1]->ne[2] : 0) <= 512 &&
                    (op->src[4]->ne[0] == 2) == (op->src[8] == nullptr) &&
                    op->src[4]->type == (op->src[4]->ne[0] == 2 ? GGML_TYPE_F32
                                                                : GGML_TYPE_F16);
         case GGML_OP_MACH1_RT_MM:
-            // rt_u stages n floats (<= 4096) and rt_out m floats (<= 8192 =
-            // 32 KB static shared) per block
-            return op->src[1]->ne[0] <= 4096 && op->src[2]->ne[0] <= 8192 &&
+            return op->src[1]->ne[0] <= (mach1_rt_radix(op->src[1]->ne[0]) == 1 ? 4096 : MACH1_RT_HADR_MAX) &&
+                   op->src[2]->ne[0] <= (mach1_rt_radix(op->src[2]->ne[0]) == 1 ? 8192 : MACH1_RT_HADR_MAX) &&
                    op->src[3]->type == GGML_TYPE_F16;
+        case GGML_OP_MACH1_DA_MM:
+        case GGML_OP_MACH1_DA_EMBED:
+            return mach1_da_smem(op->src[1]->ne[0]) <= 96*1024 &&
+                   mach1_da_smem(op->src[2]->ne[0]) <= 96*1024;
         case GGML_OP_MACH1_NE_MM:
         case GGML_OP_MACH1_EMBED_ROWS:
         case GGML_OP_MACH1_EXP_BASIS:
         case GGML_OP_MACH1_HEAD_MM:
         case GGML_OP_MACH1_EMBED_GATHER:
-            // shapes/types are enforced by the ggml builders
+        case GGML_OP_MACH1_INT_MM:
             return true;
         default:
             return false;
     }
 }
+
+static bool mach1_rt_multi_shape_ok(const ggml_tensor * op) {
+    if (op->op != GGML_OP_MACH1_RT_MM || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) ||
+        (op->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    const ggml_tensor * x = op->src[4];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[1]*x->ne[2]*x->ne[3] != 1 ||
+        op->src[0]->ne[0] != 64 || op->src[0]->type != GGML_TYPE_I16 || op->src[1]->type != GGML_TYPE_F32 ||
+        op->src[2]->type != GGML_TYPE_F32 || op->src[3]->type != GGML_TYPE_F16) {
+        return false;
+    }
+    const int n  = (int) op->src[1]->ne[0];
+    const int m  = (int) op->src[2]->ne[0];
+    const int rn = mach1_rt_radix(n);
+    const int rm = mach1_rt_radix(m);
+    static const int wg512_max = mach1_env_int("GGML_MACH1_WALK_WG512_MAX", 128);
+    return rn != 1 && rm != 1 && n % 16 == 0 && m % 16 == 0 &&
+           n <= MACH1_RT_HADR_MAX && m <= MACH1_RT_HADR_MAX &&
+           n/16 > std::max(128, wg512_max) && n/16 <= 160 &&
+           mach1_hadr_warp_ok(n, rn, 1) && mach1_hadr_warp_ok(m, rm, 1);
+}
+
+static bool mach1_rt_multi_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a == nullptr || b == nullptr || a->data == nullptr || b->data == nullptr) {
+        return false;
+    }
+    const char * pa = (const char *) a->data;
+    const char * pb = (const char *) b->data;
+    return pa < pb + ggml_nbytes(b) && pb < pa + ggml_nbytes(a);
+}
+
+#define MACH1_RT_DEFER_SLOTS 4
+struct mach1_rt_defer_slot {
+    float * buf  = nullptr;
+    bool    busy = false;
+    bool    out  = false;
+    bool    side = false;
+    cudaEvent_t ev_fork = nullptr;
+    cudaEvent_t ev_done = nullptr;
+};
+static constexpr size_t MACH1_RT_DEFER_FLOATS = (size_t) 4096 + MACH1_RT_HADR_MAX;
+static mach1_rt_defer_slot g_m1_defer[GGML_CUDA_MAX_DEVICES][MACH1_RT_DEFER_SLOTS];
+
+static int mach1_rt_defer_take(int device, cudaStream_t stream) {
+    for (int s = 0; s < MACH1_RT_DEFER_SLOTS; ++s) {
+        mach1_rt_defer_slot & sl = g_m1_defer[device][s];
+        if (sl.busy) {
+            continue;
+        }
+        if (sl.buf == nullptr) {
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone ||
+                cudaMalloc(&sl.buf, MACH1_RT_DEFER_FLOATS*sizeof(float)) != cudaSuccess ||
+                cudaEventCreateWithFlags(&sl.ev_fork, cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&sl.ev_done, cudaEventDisableTiming) != cudaSuccess) {
+                cudaGetLastError();
+                sl.buf = nullptr;
+                return -1;
+            }
+        }
+        sl.busy = true;
+        return s;
+    }
+    return -1;
+}
+
+void ggml_cuda_mach1_rt_multi_reset(int device) {
+    for (int s = 0; s < MACH1_RT_DEFER_SLOTS; ++s) {
+        g_m1_defer[device][s].busy = false;
+        g_m1_defer[device][s].out  = false;
+        g_m1_defer[device][s].side = false;
+    }
+}
+
+void ggml_cuda_mach1_rt_multi_finish(ggml_backend_cuda_context & ctx, const ggml_tensor * op, int slot) {
+    mach1_rt_defer_slot & sl = g_m1_defer[ctx.device][slot];
+    GGML_ASSERT(sl.busy && sl.buf != nullptr);
+    const int n  = (int) op->src[1]->ne[0];
+    const int m  = (int) op->src[2]->ne[0];
+    cudaStream_t stream = ctx.stream();
+    char shp[64];
+    snprintf(shp, sizeof(shp), " m=%d n=%d nt=1", m, n);
+    mach1_timed(stream, std::string("rt_out_hadr") + shp, [&]() {
+    if (sl.side) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, sl.ev_done));
+    }
+    if (sl.out) {
+        CUDA_CHECK(cudaMemcpyAsync(op->data, sl.buf + n + m, (size_t) m*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    } else {
+        GGML_ASSERT(mach1_hadr_warp_launch(true, (const float *) op->src[2]->data, sl.buf + n, (float *) op->data,
+                                           m, mach1_rt_radix(m), 1, 1, (int64_t) m, stream));
+    }
+    });
+    CUDA_CHECK(cudaGetLastError());
+    sl.busy = false;
+    sl.out  = false;
+    sl.side = false;
+}
+
+static ggml_tensor * mach1_rt_multi_vscat(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph,
+                                          int node_idx, int max_skip, const int ** perm) {
+    static const bool on = mach1_env_int("GGML_MACH1_RT_MULTI_VSCAT", 1) != 0;
+    if (!on || !mach1_hadr_tl_on() || max_skip < 8 || node_idx + 9 > cgraph->n_nodes) {
+        return nullptr;
+    }
+    const ggml_tensor * a   = cgraph->nodes[node_idx];
+    const ggml_tensor * vqk = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * vv  = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * cv  = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * rsh = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * prm = cgraph->nodes[node_idx + 5];
+    const ggml_tensor * cvt = cgraph->nodes[node_idx + 6];
+    const ggml_tensor * rs2 = cgraph->nodes[node_idx + 7];
+    ggml_tensor       * cat = cgraph->nodes[node_idx + 8];
+    const int     m      = (int) a->src[2]->ne[0];
+    const int64_t qk_off = vqk->ne[0];
+    int hd = 0, K = 0, r = 0;
+    if (a->ne[0] != m || ggml_nrows(a) != 1 ||
+        vqk->op != GGML_OP_VIEW || vv->op != GGML_OP_VIEW || cv->op != GGML_OP_CONT || cat->op != GGML_OP_CONCAT ||
+        vqk->src[0] != a || vqk->data != a->data || qk_off <= 0 || qk_off >= m || ggml_nrows(vqk) != 1 ||
+        vv->src[0] != a || (const char *) vv->data != (const char *) a->data + qk_off*sizeof(float) ||
+        vv->ne[0] != m - qk_off || ggml_nrows(vv) != 1 ||
+        cv->src[0] != vv || cv->type != GGML_TYPE_F32 || !ggml_is_contiguous(cv) ||
+        !mach1_match_tiled(rsh, prm, cvt, cv, m - qk_off, &hd, &K, &r) ||
+        rs2->op != GGML_OP_RESHAPE || rs2->src[0] != cvt || rs2->ne[0] != m - qk_off || ggml_nrows(rs2) != 1 ||
+        cat->src[0] != vqk || cat->src[1] != rs2 || ggml_get_op_params_i32(cat, 0) != 0 ||
+        cat->type != GGML_TYPE_F32 || !ggml_is_contiguous(cat) || cat->ne[0] != m || ggml_nrows(cat) != 1) {
+        return nullptr;
+    }
+    const ggml_op ops[9] = { GGML_OP_MACH1_RT_MM, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_RESHAPE,
+                             GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_CONCAT };
+    const int out_idx = node_idx + 8;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, 9, ops, &out_idx, 1)) {
+        return nullptr;
+    }
+    *perm = mach1_vtiled_perm(ctx.device, ctx.stream(), m, (int) qk_off, hd, K, r);
+    return *perm != nullptr ? cat : nullptr;
+}
+
+static ggml_tensor * mach1_rt_multi_glu(const ggml_cgraph * cgraph, int node_idx, int max_skip,
+                                        const ggml_tensor * const * ops, const int * slot, int nops) {
+    static const bool on = mach1_env_int("GGML_MACH1_RT_MULTI_GLU", 1) != 0;
+    if (!on || !mach1_hadr_tl_on() || nops != 2 || slot[1] >= 0 || max_skip < 3 ||
+        node_idx + 4 > cgraph->n_nodes || cgraph->nodes[node_idx + 1] != ops[1]) {
+        return nullptr;
+    }
+    const ggml_tensor * a   = ops[0];
+    const ggml_tensor * glu = cgraph->nodes[node_idx + 2];
+    ggml_tensor       * dn  = cgraph->nodes[node_idx + 3];
+    const int d  = (int) a->src[2]->ne[0];
+    const int rd = mach1_rt_radix(d);
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        ggml_get_op_params_i32(glu, 1) != 0 || glu->src[0] != a || glu->src[1] != ops[1] ||
+        glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || glu->ne[0] != d || ggml_nrows(glu) != 1 ||
+        (int) ops[1]->src[2]->ne[0] != d || (rd != 12 && rd != 20) || d != rd*32 ||
+        dn->op != GGML_OP_MACH1_RT_MM || dn->src[4] != glu || dn->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(dn) || (dn->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        dn->src[0]->type != GGML_TYPE_I16 || dn->src[0]->ne[0] != 64 || dn->src[1]->type != GGML_TYPE_F32 ||
+        dn->src[2]->type != GGML_TYPE_F32 || dn->src[3]->type != GGML_TYPE_F16 || (int) dn->src[1]->ne[0] != d) {
+        return nullptr;
+    }
+    const ggml_op gops[4] = { GGML_OP_MACH1_RT_MM, GGML_OP_MACH1_RT_MM, GGML_OP_GLU, GGML_OP_MACH1_RT_MM };
+    const int out_idx = node_idx + 3;
+    return ggml_can_fuse_subgraph(cgraph, node_idx, 4, gops, &out_idx, 1) ? dn : nullptr;
+}
+
+bool ggml_cuda_mach1_gated_rt(ggml_backend_cuda_context & ctx, ggml_tensor * rt, const ggml_tensor * gs,
+                              const ggml_tensor * go) {
+    static const bool on = mach1_env_int("GGML_MACH1_GATED_RT", 1) != 0 && mach1_env_int("GGML_MACH1_ABLATE", 0) == 0;
+    const ggml_tensor * x = rt->src[4];
+    if (!on || rt->op != GGML_OP_MACH1_RT_MM || x->type != GGML_TYPE_F32 || ggml_nelements(x) != x->ne[0] ||
+        gs->type != GGML_TYPE_F32 || go->type != GGML_TYPE_F32 || !ggml_is_contiguous(gs) || !ggml_is_contiguous(go) ||
+        ggml_nelements(gs) != x->ne[0] || ggml_nelements(go) != x->ne[0] || rt->src[1]->ne[0] != x->ne[0] ||
+        mach1_fold_enabled() || mach1_zbank_enabled()) {
+        return false;
+    }
+    const int n  = (int) x->ne[0];
+    const int rn = mach1_rt_radix(n);
+    if (rn == 1 || !mach1_hadr_tl_on() || !mach1_hadr_warp_ok(n, rn, 1)) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<float> su(ctx.pool(), (size_t) n);
+    char shp[64];
+    snprintf(shp, sizeof(shp), " m=%d n=%d nt=1", (int) rt->src[2]->ne[0], n);
+    mach1_timed(stream, std::string("rt_u_gated") + shp, [&]() {
+    GGML_ASSERT(mach1_hadr_warp_launch(false, (const float *) rt->src[1]->data, nullptr, su.get(), n, rn, 1, 1, 0,
+                                       stream, nullptr, 1, nullptr, (const float *) gs->data, (const float *) go->data));
+    });
+    CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_op_mach1_rt_mm(ctx, rt, nullptr, nullptr, nullptr, su.get());
+    return true;
+}
+
+int ggml_cuda_mach1_rt_multi_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx,
+                                  const ggml_tensor ** hoisted, int * hoisted_slot, int max_hoisted,
+                                  int * skip, int max_skip) {
+    if (skip != nullptr) {
+        *skip = 0;
+    }
+    static const bool on = mach1_env_int("GGML_MACH1_RT_MULTI", 1) != 0 &&
+                           mach1_env_int("GGML_MACH1_ABLATE", 0) == 0 &&
+                           mach1_env_int("GGML_MACH1_FUSE_RT", 0) == 0 &&
+                           mach1_env_int("GGML_MACH1_COOP", 0) == 0 &&
+                           mach1_env_int("GGML_MACH1_UFUSE_HADR", 0) == 0 &&
+                           mach1_env_int("GGML_MACH1_RT_MMA16", 0) == 0 &&
+                           mach1_env_int("GGML_MACH1_BANK_NT", 0) == 0 &&
+                           mach1_env_int("GGML_MACH1_DENSE_MIN_TOK", 4) >= 2 &&
+                           mach1_env_int("GGML_MACH1_WALK_VEC", 1) != 0 &&
+                           mach1_env_int("GGML_MACH1_WALK_RG", 4) == 4 &&
+                           mach1_env_int("GGML_MACH1_WALK_PROBE", 0) == 0 &&
+                           mach1_env_int("GGML_MACH1_LUT1K", 0) == 0 &&
+                           mach1_env_int("GGML_MACH1_WALK_WG640", 1) != 0 &&
+                           mach1_env_int("GGML_MACH1_WALK_PERSIST", 0) == 0 &&
+                           mach1_env_int("GGML_MACH1_LAUNCH_PROBE", 0) == 0 &&
+                           mach1_env_int("GGML_MACH1_DEBUG", 0) < 2;
+    static const int window  = mach1_env_int("GGML_MACH1_RT_MULTI_WIN", 24);
+    static const int dwindow = mach1_env_int("GGML_MACH1_RT_MULTI_DEFER_WIN", 96);
+    if (!on || max_hoisted < 2 || mach1_fold_enabled() || mach1_zbank_enabled()) {
+        return 0;
+    }
+    const ggml_tensor * a = cgraph->nodes[node_idx];
+    if (!mach1_rt_multi_shape_ok(a)) {
+        return 0;
+    }
+    const ggml_tensor * x    = a->src[4];
+    const ggml_tensor * tlut = a->src[3];
+    const int n = (int) a->src[1]->ne[0];
+    cudaStream_t stream = ctx.stream();
+    const mach1_rt_ztab zt = mach1_zdp_on() ? mach1_rt_z_table(tlut->data, stream) : mach1_rt_ztab{nullptr, 0.0f};
+    if (zt.ztab == nullptr && mach1_lutx() != 0) {
+        return 0;
+    }
+
+    const ggml_tensor * ops[3] = { a, nullptr, nullptr };
+    int slot[3] = { -1, -1, -1 };
+    int nops = 1;
+    const int jmax = std::min(cgraph->n_nodes - 1, node_idx + std::max(window, dwindow));
+    for (int j = node_idx + 1; j <= jmax && nops < 3; ++j) {
+        const ggml_tensor * b = cgraph->nodes[j];
+        if (b->op != GGML_OP_MACH1_RT_MM || b->src[4] != x || b->src[3] != tlut ||
+            (int) b->src[1]->ne[0] != n || !mach1_rt_multi_shape_ok(b)) {
+            continue;
+        }
+        bool clash = j > node_idx + window;
+        for (int k = node_idx; k < j && !clash; ++k) {
+            const ggml_tensor * t = cgraph->nodes[k];
+            clash |= mach1_rt_multi_overlap(t, b);
+            for (int s = 0; s < GGML_MAX_SRC && !clash; ++s) {
+                clash |= t->src[s] == b || mach1_rt_multi_overlap(t->src[s], b);
+            }
+        }
+        if (clash) {
+            if (j > node_idx + dwindow || (int) b->src[2]->ne[0] + n > (int) MACH1_RT_DEFER_FLOATS) {
+                continue;
+            }
+            slot[nops] = mach1_rt_defer_take(ctx.device, stream);
+            if (slot[nops] < 0) {
+                continue;
+            }
+        }
+        ops[nops++] = b;
+    }
+    if (nops < 2) {
+        return 0;
+    }
+
+    const int rn = mach1_rt_radix(n);
+    int m[3], rm[3];
+    for (int k = 0; k < nops; ++k) {
+        m[k]  = (int) ops[k]->src[2]->ne[0];
+        rm[k] = mach1_rt_radix(m[k]);
+    }
+    ggml_cuda_pool_alloc<float> scr[3] = { ggml_cuda_pool_alloc<float>(ctx.pool()),
+                                           ggml_cuda_pool_alloc<float>(ctx.pool()),
+                                           ggml_cuda_pool_alloc<float>(ctx.pool()) };
+    float * su_k[3], * sv_k[3];
+    for (int k = 0; k < nops; ++k) {
+        float * base;
+        if (slot[k] >= 0) {
+            base = g_m1_defer[ctx.device][slot[k]].buf;
+        } else {
+            scr[k].alloc((size_t) n + (size_t) m[k]);
+            base = scr[k].get();
+        }
+        su_k[k] = base;
+        sv_k[k] = base + n;
+    }
+
+    const int * perm0 = nullptr;
+    ggml_tensor * cat0 = skip != nullptr ? mach1_rt_multi_vscat(ctx, cgraph, node_idx, max_skip, &perm0) : nullptr;
+    float * dst0 = cat0 != nullptr ? (float *) cat0->data : (float *) a->data;
+    ggml_tensor * gdn = skip != nullptr && cat0 == nullptr ? mach1_rt_multi_glu(cgraph, node_idx, max_skip, ops, slot, nops)
+                                                           : nullptr;
+
+    char shp[64];
+    snprintf(shp, sizeof(shp), " ops=%d m0=%d n=%d", nops, m[0], n);
+    bool side[3] = { false, false, false };
+    cudaStream_t s1 = nullptr;
+
+    mach1_hadr_xops xu = {};
+    for (int k = 1; k < nops; ++k) {
+        xu.a[k - 1] = (const float *) ops[k]->src[1]->data;
+        xu.b[k - 1] = (const float *) x->data;
+        xu.dst[k - 1] = su_k[k];
+        xu.d[k - 1] = n;
+        xu.r[k - 1] = rn;
+    }
+    mach1_timed(stream, std::string("rt_multi_u") + shp, [&]() {
+    GGML_ASSERT(mach1_hadr_warp_launch(false, (const float *) a->src[1]->data, (const float *) x->data, su_k[0],
+                                       n, rn, 1, 1, 0, stream, &xu, nops));
+    });
+
+    mach1_rt_walk_mops wo = {};
+    int nb = 0;
+    for (int k = 0; k < 3; ++k) {
+        wo.b[k] = k < nops ? nb : INT_MAX;
+        if (k < nops) {
+            wo.trellis[k] = (const uint16_t *) ops[k]->src[0]->data;
+            wo.scr_u[k]   = su_k[k];
+            wo.scr_v[k]   = sv_k[k];
+            wo.m[k]       = m[k];
+            nb += m[k]/16;
+        }
+    }
+    const ggml_cuda_kernel_launch_params wp =
+        ggml_cuda_kernel_launch_params(dim3(nb, 1, 1), dim3(640, 1, 1), 0, stream);
+    mach1_timed(stream, std::string("rt_multi_walk") + shp, [&]() {
+    static const bool wstg = mach1_env_int("GGML_MACH1_WALK_STG", 1) != 0;
+    static const bool walk1 = mach1_env_int("GGML_MACH1_RT_MULTI_WALK1", 1) != 0;
+    static const int zside_env = mach1_env_int("GGML_MACH1_RT_ZSIDE", -1);
+    const int  cc_z     = ggml_cuda_info().devices[ctx.device].cc;
+    const bool zside_on = zside_env >= 0 ? zside_env != 0 : GGML_CUDA_CC_IS_NVIDIA(cc_z) && cc_z >= GGML_CUDA_CC_HOPPER;
+    bool defer_any = false;
+    for (int k = 1; k < nops; ++k) {
+        defer_any |= slot[k] >= 0;
+    }
+    if (zt.ztab != nullptr && wstg && n/16 <= 160 && walk1 && defer_any) {
+        mach1_smem_opt_in((const void *) mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 1>, 32*1024);
+        if (zside_on && ctx.curr_stream_no == 0) {
+            if (ctx.streams[ctx.device][1] == nullptr) {
+                cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusNone) {
+                    ctx.stream(ctx.device, 1);
+                }
+                cudaGetLastError();
+            }
+            s1 = ctx.streams[ctx.device][1];
+        }
+        for (int k = 1; k < nops; ++k) {
+            side[k] = s1 != nullptr && slot[k] >= 0 && g_m1_defer[ctx.device][slot[k]].ev_done != nullptr &&
+                      (size_t) n + 2*(size_t) m[k] <= MACH1_RT_DEFER_FLOATS;
+        }
+        for (int k = 0; k < nops; ++k) {
+            if (side[k]) {
+                continue;
+            }
+            const int gpdb = mach1_walk_pdb_grid(m[k]/16, 1, ctx.device);
+            if (gpdb < m[k]/16) {
+                mach1_smem_opt_in((const void *) mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 2>, 2*160*128);
+                const ggml_cuda_kernel_launch_params wpd =
+                    ggml_cuda_kernel_launch_params(dim3(gpdb, 1, 1), dim3(640, 1, 1), (size_t) 2*160*128, stream);
+                mach1_launch_pdl(mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 2>, wpd,
+                    (const uint16_t *) ops[k]->src[0]->data, (const half *) tlut->data, (const float *) su_k[k],
+                    (const float *) nullptr, (const float *) nullptr, sv_k[k], m[k], n,
+                    (const float *) nullptr, (float *) nullptr, (int *) nullptr, (const int *) nullptr, (const half *) nullptr,
+                    zt.ztab, zt.zstep, (const int *) nullptr);
+                continue;
+            }
+            const ggml_cuda_kernel_launch_params wpk =
+                ggml_cuda_kernel_launch_params(dim3(m[k]/16, 1, 1), dim3(640, 1, 1), (size_t) 160*128, stream);
+            mach1_launch_pdl(mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 1>, wpk,
+                (const uint16_t *) ops[k]->src[0]->data, (const half *) tlut->data, (const float *) su_k[k],
+                (const float *) nullptr, (const float *) nullptr, sv_k[k], m[k], n,
+                (const float *) nullptr, (float *) nullptr, (int *) nullptr, (const int *) nullptr, (const half *) nullptr,
+                zt.ztab, zt.zstep, (const int *) nullptr);
+        }
+    } else if (zt.ztab != nullptr && wstg && n/16 <= 160) {
+        ggml_cuda_kernel_launch_params wps = wp;
+        wps.shmem = (size_t) 160*128;
+        mach1_smem_opt_in((const void *) mach1_rt_walk_rows_v_multi_kernel<640, 1, 1>, 32*1024);
+        mach1_launch_pdl(mach1_rt_walk_rows_v_multi_kernel<640, 1, 1>, wps, wo, (const half *) tlut->data, n, zt.ztab, zt.zstep);
+    } else if (zt.ztab != nullptr) {
+        mach1_launch_pdl(mach1_rt_walk_rows_v_multi_kernel<640, 1>, wp, wo, (const half *) tlut->data, n, zt.ztab, zt.zstep);
+    } else {
+        mach1_launch_pdl(mach1_rt_walk_rows_v_multi_kernel<640, 0>, wp, wo, (const half *) tlut->data, n,
+                     (const uint16_t *) nullptr, 0.0f);
+    }
+    });
+
+    if (gdn != nullptr) {
+        ggml_cuda_pool_alloc<float> sud(ctx.pool(), (size_t) m[0]);
+        mach1_timed(stream, std::string("rt_multi_glu_in") + shp, [&]() {
+        const dim3 g1(1, 1, 1), b1(1024, 1, 1);
+        if (rm[0] == 12) {
+            mach1_launch_pdl_raw(mach1_hadr_glu_in_kernel<12>, g1, b1, 0, stream,
+                (const float *) a->src[2]->data, (const float *) ops[1]->src[2]->data, (const float *) sv_k[0],
+                (const float *) sv_k[1], (const float *) gdn->src[1]->data, sud.get());
+        } else {
+            mach1_launch_pdl_raw(mach1_hadr_glu_in_kernel<20>, g1, b1, 0, stream,
+                (const float *) a->src[2]->data, (const float *) ops[1]->src[2]->data, (const float *) sv_k[0],
+                (const float *) sv_k[1], (const float *) gdn->src[1]->data, sud.get());
+        }
+        });
+        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_op_mach1_rt_mm(ctx, gdn, nullptr, nullptr, nullptr, sud.get());
+        *skip = 3;
+        return 0;
+    }
+
+    static const bool dout = mach1_env_int("GGML_MACH1_RT_MULTI_DEFER_OUT", 1) != 0;
+    mach1_hadr_xops xv = {};
+    int nv = 1;
+    bool joined[3] = { true, false, false };
+    for (int k = 1; k < nops; ++k) {
+        if (side[k]) {
+            continue;
+        }
+        const bool dj = slot[k] >= 0 && dout && (size_t) n + 2*(size_t) m[k] <= MACH1_RT_DEFER_FLOATS;
+        if ((slot[k] < 0 || dj) && m[k]/rm[k] == m[0]/rm[0]) {
+            xv.a[nv - 1] = (const float *) ops[k]->src[2]->data;
+            xv.b[nv - 1] = sv_k[k];
+            xv.dst[nv - 1] = dj ? sv_k[k] + m[k] : (float *) ops[k]->data;
+            if (dj) {
+                g_m1_defer[ctx.device][slot[k]].out = true;
+            }
+            xv.d[nv - 1] = m[k];
+            xv.r[nv - 1] = rm[k];
+            joined[k] = true;
+            nv++;
+        }
+    }
+    mach1_timed(stream, std::string("rt_multi_out") + shp, [&]() {
+    GGML_ASSERT(mach1_hadr_warp_launch(true, (const float *) a->src[2]->data, sv_k[0], dst0,
+                                       m[0], rm[0], 1, 1, (int64_t) m[0], stream, &xv, nv, perm0));
+    for (int k = 1; k < nops; ++k) {
+        if (!joined[k] && slot[k] < 0) {
+            GGML_ASSERT(mach1_hadr_warp_launch(true, (const float *) ops[k]->src[2]->data, sv_k[k],
+                                               (float *) ops[k]->data, m[k], rm[k], 1, 1, (int64_t) m[k], stream));
+        }
+    }
+    });
+    CUDA_CHECK(cudaGetLastError());
+
+    static const int zside_blocks_env = mach1_env_int("GGML_MACH1_RT_ZSIDE_BLOCKS", -1);
+    const int zside_blocks = zside_blocks_env >= 0 ? zside_blocks_env : ggml_cuda_info().devices[ctx.device].nsm;
+    for (int k = 1; k < nops; ++k) {
+        if (!side[k]) {
+            continue;
+        }
+        mach1_rt_defer_slot & sl = g_m1_defer[ctx.device][slot[k]];
+        CUDA_CHECK(cudaEventRecord(sl.ev_fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(s1, sl.ev_fork));
+        int gb = zside_blocks > 0 ? std::min(m[k]/16, zside_blocks) : m[k]/16;
+        if (mach1_walk_pdb(ctx.device) > 0 && gb < m[k]/16) {
+            const int rpb = (m[k]/16 + gb - 1)/gb;
+            gb = (m[k]/16 + rpb - 1)/rpb;
+            mach1_smem_opt_in((const void *) mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 2>, 2*160*128);
+            const ggml_cuda_kernel_launch_params wpd =
+                ggml_cuda_kernel_launch_params(dim3(gb, 1, 1), dim3(640, 1, 1), (size_t) 2*160*128, s1);
+            mach1_launch_pdl(mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 2>, wpd,
+                (const uint16_t *) ops[k]->src[0]->data, (const half *) tlut->data, (const float *) su_k[k],
+                (const float *) nullptr, (const float *) nullptr, sv_k[k], m[k], n,
+                (const float *) nullptr, (float *) nullptr, (int *) nullptr, (const int *) nullptr, (const half *) nullptr,
+                zt.ztab, zt.zstep, (const int *) nullptr);
+        } else {
+        const ggml_cuda_kernel_launch_params wpk =
+            ggml_cuda_kernel_launch_params(dim3(gb, 1, 1), dim3(640, 1, 1), (size_t) 160*128, s1);
+        mach1_launch_pdl(mach1_rt_walk_rows_v_kernel<640, 4, 0, 0, 0, 0, 1, 1>, wpk,
+            (const uint16_t *) ops[k]->src[0]->data, (const half *) tlut->data, (const float *) su_k[k],
+            (const float *) nullptr, (const float *) nullptr, sv_k[k], m[k], n,
+            (const float *) nullptr, (float *) nullptr, (int *) nullptr, (const int *) nullptr, (const half *) nullptr,
+            zt.ztab, zt.zstep, (const int *) nullptr);
+        }
+        GGML_ASSERT(mach1_hadr_warp_launch(true, (const float *) ops[k]->src[2]->data, sv_k[k], sv_k[k] + m[k],
+                                           m[k], rm[k], 1, 1, (int64_t) m[k], s1));
+        CUDA_CHECK(cudaEventRecord(sl.ev_done, s1));
+        sl.out  = true;
+        sl.side = true;
+    }
+
+    for (int k = 1; k < nops; ++k) {
+        hoisted[k - 1]      = ops[k];
+        hoisted_slot[k - 1] = slot[k];
+    }
+    if (cat0 != nullptr) {
+        *skip = 8;
+    }
+    return nops - 1;
+}
+
+#else
+
+void ggml_cuda_op_mach1_ne_mm(ggml_backend_cuda_context &, ggml_tensor * dst) {
+    GGML_LOG_ERROR("%s: mach1 ops need CUDA\n", ggml_op_desc(dst));
+}
+
+void ggml_cuda_op_mach1_embed_rows(ggml_backend_cuda_context &, ggml_tensor * dst) {
+    GGML_LOG_ERROR("%s: mach1 ops need CUDA\n", ggml_op_desc(dst));
+}
+
+void ggml_cuda_op_mach1_exp_mm(ggml_backend_cuda_context &, ggml_tensor * dst) {
+    GGML_LOG_ERROR("%s: mach1 ops need CUDA\n", ggml_op_desc(dst));
+}
+
+void ggml_cuda_op_mach1_exp_basis(ggml_backend_cuda_context &, ggml_tensor * dst) {
+    GGML_LOG_ERROR("%s: mach1 ops need CUDA\n", ggml_op_desc(dst));
+}
+
+void ggml_cuda_op_mach1_head_mm(ggml_backend_cuda_context &, ggml_tensor * dst) {
+    GGML_LOG_ERROR("%s: mach1 ops need CUDA\n", ggml_op_desc(dst));
+}
+
+void ggml_cuda_op_mach1_embed_gather(ggml_backend_cuda_context &, ggml_tensor * dst) {
+    GGML_LOG_ERROR("%s: mach1 ops need CUDA\n", ggml_op_desc(dst));
+}
+
+void ggml_cuda_op_mach1_da_mm(ggml_backend_cuda_context &, ggml_tensor * dst) {
+    GGML_LOG_ERROR("%s: mach1 ops need CUDA\n", ggml_op_desc(dst));
+}
+
+void ggml_cuda_op_mach1_int_mm(ggml_backend_cuda_context &, ggml_tensor * dst) {
+    GGML_LOG_ERROR("%s: mach1 ops need CUDA\n", ggml_op_desc(dst));
+}
+
+void ggml_cuda_op_mach1_da_embed(ggml_backend_cuda_context &, ggml_tensor * dst) {
+    GGML_LOG_ERROR("%s: mach1 ops need CUDA\n", ggml_op_desc(dst));
+}
+
+void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context &, ggml_tensor * dst, const void *, const int *,
+                              const mach1_rt_tail *, const float *) {
+    GGML_LOG_ERROR("%s: mach1 ops need CUDA\n", ggml_op_desc(dst));
+}
+
+bool ggml_cuda_mach1_supported(const ggml_tensor *) {
+    return false;
+}
+
+bool ggml_cuda_mach1_skinny_mm(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) {
+    return false;
+}
+
+int ggml_cuda_mach1_exp_ffn_reject_line() {
+    return 0;
+}
+
+int ggml_cuda_mach1_exp_ffn_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int) {
+    return 0;
+}
+
+int ggml_cuda_mach1_shexp_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int) {
+    return 0;
+}
+
+int ggml_cuda_mach1_vtiled_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int) {
+    return 0;
+}
+
+int ggml_cuda_mach1_xperm_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int) {
+    return 0;
+}
+
+int ggml_cuda_mach1_qkv_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int) {
+    return 0;
+}
+
+int ggml_cuda_mach1_rt_tail_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int) {
+    return 0;
+}
+
+int ggml_cuda_mach1_gdn_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int) {
+    return 0;
+}
+
+int ggml_cuda_mach1_gdn_prep_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int) {
+    return 0;
+}
+
+int ggml_cuda_mach1_gdn_full_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int) {
+    return 0;
+}
+
+int ggml_cuda_mach1_gdn_proj_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int) {
+    return 0;
+}
+
+int ggml_cuda_mach1_rt_multi_fuse(ggml_backend_cuda_context &, const ggml_cgraph *, int, const ggml_tensor **, int *, int,
+                                  int *, int) {
+    return 0;
+}
+
+void ggml_cuda_mach1_rt_multi_finish(ggml_backend_cuda_context &, const ggml_tensor *, int) {
+}
+
+void ggml_cuda_mach1_rt_multi_reset(int) {
+}
+
+bool ggml_cuda_mach1_gated_rt(ggml_backend_cuda_context &, ggml_tensor * dst, const ggml_tensor *, const ggml_tensor *) {
+    return false;
+}
+
+#endif

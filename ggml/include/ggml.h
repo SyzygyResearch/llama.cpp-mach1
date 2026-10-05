@@ -598,6 +598,11 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MACH1_DA_MM,
+        GGML_OP_MACH1_INT_MM,
+        GGML_OP_MACH1_DA_EMBED,
+        GGML_OP_MACH1_D4_MM,
+
         GGML_OP_COUNT,
     };
 
@@ -2707,7 +2712,7 @@ extern "C" {
 
     // Mach-1 rotated int-lattice trellis dense matmul (payload v3 NE spine).
     // Same trellis/LUT/FWHT machinery as ggml_mach1_exp_mm but a single dense
-    // tensor: W = diag(sv).H_m.fp16(hatWr).H_n.diag(su), y = W x. su/sv are F32
+    // tensor: W = diag(sv).H_m.fp16(hatWr).H_n^T.diag(su), y = W x. su/sv are F32
     // (int8 signs, with the per-matrix F32 Wscale folded into sv at export —
     // exact). K derives from words-per-tile (shipped: K=4, 64 words).
     //   trellis: I16 [K*16, (m/16)*(n/16)]   tlut: F16 [2, 512]
@@ -2744,6 +2749,56 @@ extern "C" {
             struct ggml_tensor  * codes,
             struct ggml_tensor  * lut,
             struct ggml_tensor  * ids);
+
+    // Mach-1 dense additive trellis matmul (payload v4): y = W x, W an E-block
+    // stack of trellis-coded [mb, nb] blocks (split: 0 none, 1 in, 2 out).
+    GGML_API struct ggml_tensor * ggml_mach1_da_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * su,
+            struct ggml_tensor  * sv,
+            struct ggml_tensor  * wgamma,
+            struct ggml_tensor  * tlut,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * exc_idx,
+            struct ggml_tensor  * exc_rows,
+            int                   mode,
+            int                   split,
+            int                   exc_base);
+
+    // Mach-1 grouped asymmetric integer matmul (payload v4): y = W x.
+    GGML_API struct ggml_tensor * ggml_mach1_int_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * mn,
+            struct ggml_tensor  * mx,
+            struct ggml_tensor  * x,
+            int                   bits);
+
+    // Mach-1 trellis embedding row gather (payload v4).
+    GGML_API struct ggml_tensor * ggml_mach1_da_embed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * su,
+            struct ggml_tensor  * sv,
+            struct ggml_tensor  * wgamma,
+            struct ggml_tensor  * tlut,
+            struct ggml_tensor  * ids,
+            int                   mode);
+
+    // Mach-1 D4 routed-expert matmul (payload v5): y[:, i, t] = W[ids[i, t]] x[:, i, t].
+    GGML_API struct ggml_tensor * ggml_mach1_d4_mm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * offs,
+            struct ggml_tensor  * su,
+            struct ggml_tensor  * sv,
+            struct ggml_tensor  * gw,
+            struct ggml_tensor  * zt,
+            struct ggml_tensor  * units,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * x,
+            const int32_t       * hash);
 
     // DSA lightning indexer
     //

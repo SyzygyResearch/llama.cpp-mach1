@@ -1,0 +1,30 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint E;
+    uint mb;
+    uint nt;
+    uint mask_off;
+};
+
+layout(binding = 0) readonly buffer IdsBuf { int ids[]; };
+layout(binding = 1) writeonly buffer FBuf { float scr[]; };
+
+void main() {
+    const uint e = gl_GlobalInvocationID.x;
+    if (e >= E) {
+        return;
+    }
+    float used = 0.0f;
+    for (uint t = 0; t < nt; ++t) {
+        if (uint(ids[t]) / mb == e) {
+            used = 1.0f;
+            break;
+        }
+    }
+    scr[mask_off + e] = used;
+}

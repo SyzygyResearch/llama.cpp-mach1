@@ -1065,10 +1065,25 @@ void process_shaders() {
     string_to_spv("mach1_rt_u_f32",       "mach1_rt_u.comp",       {});
     string_to_spv("mach1_rt_walk_f32",    "mach1_rt_walk.comp",    {});
     string_to_spv("mach1_rt_out_f32",     "mach1_rt_out.comp",     {});
+    string_to_spv("mach1_rt_qbfly_f32",   "mach1_rt_qbfly.comp",   {});
+    string_to_spv("mach1_rt_qradix_f32",  "mach1_rt_qradix.comp",  {});
     string_to_spv("mach1_head_mm_f32",    "mach1_head_mm.comp",    {});
     string_to_spv("mach1_embed_gather_f32", "mach1_embed_gather.comp", {});
     string_to_spv("mach1_exp_out_f32",    "mach1_exp_out.comp",    {});
     string_to_spv("mach1_exp_basis_f32",  "mach1_exp_basis.comp",  {});
+    string_to_spv("mach1_d4_u_f32",       "mach1_d4_u.comp",       {});
+    string_to_spv("mach1_d4_map_f32",     "mach1_d4_map.comp",     {});
+    string_to_spv("mach1_d4_walk_f32",    "mach1_d4_walk.comp",    {});
+    string_to_spv("mach1_d4_out_f32",     "mach1_d4_out.comp",     {});
+    string_to_spv("mach1_da_decode_f32",  "mach1_da_decode.comp",  {});
+    string_to_spv("mach1_da_fwht_f32",    "mach1_da_fwht.comp",    {});
+    string_to_spv("mach1_da_bfly_f32",    "mach1_da_bfly.comp",    {});
+    string_to_spv("mach1_da_radix_f32",   "mach1_da_radix.comp",   {});
+    string_to_spv("mach1_da_apply_f32",   "mach1_da_apply.comp",   {});
+    string_to_spv("mach1_da_exc_f32",     "mach1_da_exc.comp",     {});
+    string_to_spv("mach1_da_embed_mask_f32", "mach1_da_embed_mask.comp", {});
+    string_to_spv("mach1_da_embed_copy_f32", "mach1_da_embed_copy.comp", {});
+    string_to_spv("mach1_int_mm_f32",     "mach1_int_mm.comp",     {});
 
     string_to_spv("gated_delta_net_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}}));
     string_to_spv("gated_delta_net_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));

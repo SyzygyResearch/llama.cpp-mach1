@@ -44,12 +44,15 @@ void main() {
     const uint words   = 64u;
     const uint tiles_y = n / 16u;
     const uint tbase   = (tr*tiles_y)*words;
-    const bool have    = tid < tiles_y;
     const uint v_base  = n_tok*n;
 
-    if (have) {
-        const uint tw = tbase + tid*words;
-        const uint ub = t*n + tid*16u;
+    float part[16];
+    [[unroll]] for (uint i = 0; i < 16u; ++i) {
+        part[i] = 0.0f;
+    }
+    for (uint ct = tid; ct < tiles_y; ct += WG) {
+        const uint tw = tbase + ct*words;
+        const uint ub = t*n + ct*16u;
 
         // the tile column's 16 u values are shared by all 16 tile rows
         float uu[16];
@@ -88,12 +91,11 @@ void main() {
                 }
                 acc += a0*uu[2u*j] + v1[j]*uu[2u*j + 1u];
             }
-            red[ri][tid] = acc;
+            part[ri] = ct == tid ? acc : part[ri] + acc;
         }
-    } else {
-        [[unroll]] for (uint i = 0; i < 16u; ++i) {
-            red[i][tid] = 0.0f;
-        }
+    }
+    [[unroll]] for (uint i = 0; i < 16u; ++i) {
+        red[i][tid] = part[i];
     }
     barrier();
     [[unroll]] for (uint s = WG/2u; s > 0u; s >>= 1) {

@@ -321,6 +321,8 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
 
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id0(ggml_metal_buffer_t buf);
+
 #ifdef __cplusplus
 }
 #endif

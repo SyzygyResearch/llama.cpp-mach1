@@ -226,6 +226,22 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_flash_attn_ext_extra_blk(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
             } break;
+        case GGML_OP_MACH1_DA_MM:
+            {
+                res += ggml_metal_op_mach1_da_mm_extra(tensor);
+            } break;
+        case GGML_OP_MACH1_DA_EMBED:
+            {
+                res += ggml_metal_op_mach1_da_embed_extra(tensor);
+            } break;
+        case GGML_OP_MACH1_D4_MM:
+            {
+                res += ggml_metal_op_mach1_d4_mm_extra(tensor);
+            } break;
+        case GGML_OP_MACH1_RT_MM:
+            {
+                res += ggml_metal_op_mach1_rt_mm_extra(tensor);
+            } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
             {

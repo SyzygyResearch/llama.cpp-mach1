@@ -1048,6 +1048,16 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     }
 }
 
+static bool ggml_metal_mach1_da_dim_ok(int64_t d) {
+    if (d <= 0 || d % 16 != 0) {
+        return false;
+    }
+    while (d % 2 == 0) {
+        d /= 2;
+    }
+    return d == 1 || d == 3 || d == 5;
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
@@ -1273,6 +1283,47 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_MACH1_INT_MM:
+            return true;
+        case GGML_OP_MACH1_D4_MM:
+            {
+                const int64_t n   = op->src[2]->ne[0];
+                const int64_t m   = op->src[3]->ne[0];
+                const int64_t E   = op->src[1]->ne[1];
+                const int64_t tgf = MIN(8192, (int64_t)(dev->props.max_theadgroup_memory_size/sizeof(float)));
+                return has_simdgroup_reduction &&
+                    ggml_metal_mach1_da_dim_ok(n) && ggml_metal_mach1_da_dim_ok(m) &&
+                    n <= tgf && m <= tgf && E + 1024 <= tgf &&
+                    op->src[7]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[8]);
+            }
+        case GGML_OP_MACH1_RT_MM:
+            {
+                const int64_t n = op->src[1]->ne[0];
+                const int64_t m = op->src[2]->ne[0];
+                return has_simdgroup_reduction &&
+                    op->src[0]->ne[0] == 64 && op->src[3]->type == GGML_TYPE_F16 &&
+                    ggml_metal_mach1_da_dim_ok(n) && ggml_metal_mach1_da_dim_ok(m) &&
+                    ggml_is_contiguous(op->src[4]);
+            }
+        case GGML_OP_MACH1_HEAD_MM:
+            return has_simdgroup_reduction && op->src[2]->ne[0] % 64 == 0 && ggml_is_contiguous(op->src[2]);
+        case GGML_OP_MACH1_EMBED_GATHER:
+            return op->ne[0] % 64 == 0;
+        case GGML_OP_MACH1_DA_MM:
+        case GGML_OP_MACH1_DA_EMBED:
+            {
+                const int64_t nb  = op->src[1]->ne[0];
+                const int64_t mb  = op->src[2]->ne[0];
+                const int64_t tgf = MIN(8192, (int64_t)(dev->props.max_theadgroup_memory_size/sizeof(float)));
+                if (!has_simdgroup_reduction || !ggml_metal_mach1_da_dim_ok(nb) || !ggml_metal_mach1_da_dim_ok(mb)) {
+                    return false;
+                }
+                if (op->op == GGML_OP_MACH1_DA_EMBED) {
+                    return nb <= tgf && mb <= tgf;
+                }
+                const int32_t split = ((const int32_t *) op->op_params)[1];
+                return nb <= tgf && (mb <= tgf || (mb <= 16384 && split != 1));
+            }
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
@@ -1888,6 +1939,14 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
     }
+}
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id0(ggml_metal_buffer_t buf) {
+    struct ggml_metal_buffer_id res = { nil, 0 };
+    if (buf && buf->n_buffers == 1) {
+        res.metal = buf->buffers[0].metal;
+    }
+    return res;
 }
 
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {

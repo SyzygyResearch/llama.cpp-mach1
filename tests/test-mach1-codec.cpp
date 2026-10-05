@@ -66,12 +66,110 @@ int main(int argc, char ** argv) {
         return t;
     };
 
-    ggml_init_params ip = { /*.mem_size =*/ (size_t) 512*1024*1024, /*.mem_buffer =*/ NULL, /*.no_alloc =*/ false };
+    ggml_init_params ip = {  (size_t) 1536*1024*1024,  NULL,  false };
     ggml_context * ctx = ggml_init(ip);
+
+    const int fixkey = gguf_find_key(gctx, "mach1.fixtures.version");
+
+    if (fixkey >= 0 && gguf_get_val_u32(gctx, fixkey) >= 4) {
+        auto make_eye = [&](int64_t d) {
+            ggml_tensor * e = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, d);
+            memset(e->data, 0, ggml_nbytes(e));
+            for (int64_t i = 0; i < d; ++i) {
+                ((float *) e->data)[i*d + i] = 1.0f;
+            }
+            return e;
+        };
+        ggml_tensor * tlut = get("da4.tlut");
+
+        struct da_case { const char * set; int mode; int split; bool optional; ggml_tensor * y; };
+        da_case dcs[] = {
+            { "da4.k15",     0, 0, false, NULL },
+            { "da4.k175s1",  1, 0, false, NULL },
+            { "da4.k1875s1", 1, 0, false, NULL },
+            { "da4.eout",    0, 2, false, NULL },
+            { "da4.ein",     0, 1, false, NULL },
+            { "da4.h20",     0, 0, true,  NULL },
+        };
+        char nb[64];
+        for (auto & c : dcs) {
+            snprintf(nb, sizeof(nb), "%s.trellis", c.set);
+            if (c.optional && !ggml_get_tensor(ctx_data, nb)) {
+                continue;
+            }
+            auto gete = [&](const char * f) {
+                snprintf(nb, sizeof(nb), "%s.%s", c.set, f);
+                return get(nb);
+            };
+            ggml_tensor * golden = gete("golden");
+            c.y = ggml_mach1_da_mm(ctx, gete("trellis"), gete("su"), gete("sv"),
+                                   gete("wgamma"), tlut, make_eye(golden->ne[1]),
+                                   NULL, NULL, c.mode, c.split, 0);
+        }
+
+        ggml_tensor * y_exc = ggml_mach1_da_mm(ctx, get("exc4.trellis"), get("exc4.su"),
+                                               get("exc4.sv"), get("exc4.wgamma"), tlut,
+                                               make_eye(get("exc4.golden")->ne[1]),
+                                               get("exc4.exc_idx"), get("exc4.exc_rows"), 0, 0, 0);
+
+        struct int_case { const char * set; ggml_tensor * y; };
+        int_case ics[] = { { "int4.q3", NULL }, { "int4.q4", NULL }, { "int4.head", NULL } };
+        for (auto & c : ics) {
+            auto gete = [&](const char * f) {
+                snprintf(nb, sizeof(nb), "%s.%s", c.set, f);
+                return get(nb);
+            };
+            ggml_tensor * q = gete("q");
+            const int64_t n = gete("golden")->ne[1];
+            const int bits  = (int)(q->ne[0]*8/n);
+            c.y = ggml_mach1_int_mm(ctx, q, gete("mn"), gete("mx"), make_eye(n), bits);
+        }
+
+        ggml_tensor * y_emb = ggml_mach1_da_embed(ctx, get("emb4.trellis"), get("emb4.su"),
+                                                  get("emb4.sv"), get("emb4.wgamma"), tlut,
+                                                  get("emb4.ids"), 1);
+
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+        for (auto & c : dcs) {
+            if (c.y) {
+                ggml_build_forward_expand(gf, c.y);
+            }
+        }
+        ggml_build_forward_expand(gf, y_exc);
+        for (auto & c : ics) {
+            ggml_build_forward_expand(gf, c.y);
+        }
+        ggml_build_forward_expand(gf, y_emb);
+        if (ggml_graph_compute_with_ctx(ctx, gf, 4) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "graph compute failed\n");
+            return 2;
+        }
+
+        int rc = 0;
+        for (auto & c : dcs) {
+            if (!c.y) {
+                continue;
+            }
+            snprintf(nb, sizeof(nb), "%s.golden", c.set);
+            rc |= compare_bits(c.set, c.y, get(nb));
+        }
+        rc |= compare_bits("exc4", y_exc, get("exc4.golden"));
+        for (auto & c : ics) {
+            snprintf(nb, sizeof(nb), "%s.golden", c.set);
+            rc |= compare_bits(c.set, c.y, get(nb));
+        }
+        rc |= compare_bits("emb4", y_emb, get("emb4.golden"));
+
+        ggml_free(ctx);
+        ggml_free(ctx_data);
+        gguf_free(gctx);
+        printf(rc == 0 ? "PASS: all mach1 v4 codec kernels bit-exact vs reference goldens\n"
+                       : "FAIL (v4)\n");
+        return rc;
+    }
 
     // v3 (additive payload) fixture set: V8+wave_gamma experts, rotated NE,
     // int5-g64 head, nibble-LUT embed
-    const int fixkey = gguf_find_key(gctx, "mach1.fixtures.version");
     if (fixkey >= 0 && gguf_get_val_u32(gctx, fixkey) >= 3) {
         auto make_eye = [&](int64_t d) {
             ggml_tensor * e = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, d);

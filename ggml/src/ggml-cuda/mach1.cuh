@@ -19,9 +19,13 @@ struct mach1_rt_tail {
 // keep the ordinary path.
 void ggml_cuda_op_mach1_rt_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                               const void * x_data_override = nullptr, const int * xperm = nullptr,
-                              const mach1_rt_tail * tail = nullptr);
+                              const mach1_rt_tail * tail = nullptr, const float * su_ready = nullptr);
 void ggml_cuda_op_mach1_head_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_mach1_embed_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+void ggml_cuda_op_mach1_da_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_mach1_int_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_op_mach1_da_embed(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 bool ggml_cuda_mach1_supported(const ggml_tensor * op);
 
@@ -87,3 +91,12 @@ int ggml_cuda_mach1_gdn_full_fuse(ggml_backend_cuda_context & ctx, const ggml_cg
 // GDN_FULL level 3: the region extended backwards over the beta/alpha
 // projections and the conv-state round trip; entered at the beta mul_mat
 int ggml_cuda_mach1_gdn_proj_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+
+int ggml_cuda_mach1_rt_multi_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx,
+                                  const ggml_tensor ** hoisted, int * hoisted_slot, int max_hoisted,
+                                  int * skip = nullptr, int max_skip = 0);
+void ggml_cuda_mach1_rt_multi_finish(ggml_backend_cuda_context & ctx, const ggml_tensor * op, int slot);
+void ggml_cuda_mach1_rt_multi_reset(int device);
+
+bool ggml_cuda_mach1_gated_rt(ggml_backend_cuda_context & ctx, ggml_tensor * rt, const ggml_tensor * gs,
+                              const ggml_tensor * go);

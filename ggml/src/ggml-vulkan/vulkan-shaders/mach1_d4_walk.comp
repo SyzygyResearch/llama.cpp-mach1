@@ -1,0 +1,142 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+#define TT 8u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n;
+    uint Mb;
+    uint Nb;
+    uint n_used;
+    uint n_expert;
+    uint ids_s0;
+    uint ids_s1;
+    uint grouped;
+    uint u_off;
+    uint p_off;
+    uint map_off;
+    int  hash[15];
+};
+
+layout(binding = 0) readonly buffer TrBuf { uint16_t trellis[]; };
+layout(binding = 1) readonly buffer OBuf  { int offs[]; };
+layout(binding = 2) readonly buffer GBuf  { float gw[]; };
+layout(binding = 3) readonly buffer ZBuf  { uint16_t zt[]; };
+layout(binding = 4) readonly buffer UnBuf { float units[]; };
+layout(binding = 5) readonly buffer IBuf  { int ids[]; };
+layout(binding = 6) readonly buffer MBuf  { int scr_i[]; };
+layout(binding = 7) buffer FBuf { float scr_f[]; };
+
+shared float red[WG];
+
+uint win(const uint tw, const uint words, const uint b) {
+    const uint wi = b >> 4;
+    const uint o  = b & 15u;
+    const uint wn = wi + 1u < words ? wi + 1u : wi + 1u - words;
+    const uint w2 = (uint(trellis[tw + wi]) << 16) | uint(trellis[tw + wn]);
+    return (w2 >> (16u - o)) & 0xFFFFu;
+}
+
+void levels(const uint s, const uint mult, const uint lv0, const uint lv1, const uint zr, inout float w[8], const uint o) {
+    if (mult != 0u) {
+        const uint h = (s*mult) >> 16;
+        [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+            const uint k = (h >> (4u*c)) & 15u;
+            w[o + c] = float(bitfieldExtract(int(k < 8u ? lv0 : lv1), int(4u*(k & 7u)), 4));
+        }
+    } else {
+        const uint v = uint(zt[zr + s]);
+        [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+            w[o + c] = float(int((v >> (4u*c)) & 15u) - 8);
+        }
+    }
+}
+
+void main() {
+    const uint rb   = gl_WorkGroupID.x;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint lane = tid & 31u;
+    const uint sl   = tid >> 5;
+    const uint m    = Mb*16u;
+
+    uint e, np, pl0;
+    if (grouped != 0u) {
+        e   = gl_WorkGroupID.y;
+        pl0 = uint(scr_i[map_off + e]);
+        np  = uint(scr_i[map_off + e + 1u]) - pl0;
+        if (np == 0u) {
+            return;
+        }
+    } else {
+        pl0 = gl_WorkGroupID.y;
+        e   = uint(ids[(pl0 % n_used)*ids_s0 + (pl0 / n_used)*ids_s1]);
+        np  = 1u;
+    }
+
+    const uint  K4    = uint(offs[2u*e + 1u]);
+    const uint  words = 4u*K4;
+    const uint  r     = K4 - 4u;
+    const float un    = units[r];
+    const uint  mult  = uint(hash[3u*r]);
+    const uint  lv0   = uint(hash[3u*r + 1u]);
+    const uint  lv1   = uint(hash[3u*r + 2u]);
+    const uint  zr    = r*65536u;
+    const uint  tr0   = uint(offs[2u*e]) + rb*Nb*words;
+    const uint  gwe   = e*(Mb + Nb);
+
+    const uint b0 = 2u*lane*K4;
+    const uint ri = lane >> 1;
+    const uint ci = (8u*lane) & 15u;
+
+    const uint depth = (Nb + 7u)/8u;
+    const uint cb0   = sl*depth;
+    const uint cbe   = min(cb0 + depth, Nb);
+
+    for (uint k0 = 0u; k0 < np; k0 += TT) {
+        const uint ntt = min(TT, np - k0);
+        uint pk[TT];
+        [[unroll]] for (uint k = 0u; k < TT; ++k) {
+            pk[k] = grouped != 0u ? (k < ntt ? uint(scr_i[map_off + n_expert + 1u + pl0 + k0 + k]) : 0u) : pl0;
+        }
+        float acc[TT];
+        [[unroll]] for (uint k = 0u; k < TT; ++k) {
+            acc[k] = 0.0f;
+        }
+        for (uint cb = cb0; cb < cbe; ++cb) {
+            const uint tw = tr0 + cb*words;
+            float w[8];
+            levels(win(tw, words, b0),      mult, lv0, lv1, zr, w, 0u);
+            levels(win(tw, words, b0 + K4), mult, lv0, lv1, zr, w, 4u);
+            const uint wv = rb + cb <= Nb - 1u ? Mb + Nb - 1u - (rb + cb) : Mb + Nb - 2u - (rb + cb);
+            const float sc = un*gw[gwe + wv];
+            const uint uo = cb*16u + ci;
+            [[unroll]] for (uint k = 0u; k < TT; ++k) {
+                if (k < ntt) {
+                    const uint ub = u_off + pk[k]*n + uo;
+                    float dt = 0.0f;
+                    [[unroll]] for (uint c = 0u; c < 8u; ++c) {
+                        dt += w[c]*scr_f[ub + c];
+                    }
+                    acc[k] += sc*dt;
+                }
+            }
+        }
+        for (uint k = 0u; k < ntt; ++k) {
+            red[tid] = acc[k];
+            barrier();
+            if (tid < 16u) {
+                float s2 = 0.0f;
+                for (uint q = 0u; q < 8u; ++q) {
+                    s2 += red[q*32u + 2u*tid] + red[q*32u + 2u*tid + 1u];
+                }
+                scr_f[p_off + pk[k]*m + rb*16u + tid] = s2;
+            }
+            barrier();
+        }
+    }
+}

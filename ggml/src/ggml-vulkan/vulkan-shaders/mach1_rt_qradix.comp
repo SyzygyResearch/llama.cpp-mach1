@@ -1,0 +1,53 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint d;
+    uint M;
+    uint tr;
+    uint omode;
+    uint v_base;
+};
+
+layout(binding = 0) readonly buffer SvBuf { float sv[]; };
+layout(binding = 1) buffer FBuf { float scr[]; };
+layout(binding = 2) buffer DstBuf { float dst[]; };
+
+const uint MACH1_Q12[12] = uint[](4094u, 1140u, 2280u, 466u, 932u, 1864u, 3728u, 3362u, 2630u, 1166u, 2332u, 570u);
+const uint MACH1_Q20[20] = uint[](1048574u, 398820u, 797640u, 546706u, 44838u, 89676u, 179352u, 358704u, 717408u, 386242u,
+                                  772484u, 496394u, 992788u, 937002u, 825430u, 602286u, 155998u, 311996u, 623992u, 199410u);
+
+void main() {
+    const uint b = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    if (b >= M) {
+        return;
+    }
+    const uint r = d / M;
+    const uint o = v_base + t*d;
+    const float sc = sqrt(float(d));
+
+    float col[20];
+    for (uint c = 0u; c < r; ++c) {
+        col[c] = scr[o + c*M + b];
+    }
+    for (uint a = 0u; a < r; ++a) {
+        float acc = 0.0f;
+        for (uint c = 0u; c < r; ++c) {
+            const uint row = tr != 0u ? c : a;
+            const uint bit = tr != 0u ? a : c;
+            const uint h   = r == 12u ? MACH1_Q12[row] : MACH1_Q20[row];
+            acc = ((h >> bit) & 1u) != 0u ? acc - col[c] : acc + col[c];
+        }
+        const float val = acc / sc;
+        const uint i = a*M + b;
+        if (omode != 0u) {
+            dst[t*d + i] = val * sv[i];
+        } else {
+            scr[o + i] = val;
+        }
+    }
+}

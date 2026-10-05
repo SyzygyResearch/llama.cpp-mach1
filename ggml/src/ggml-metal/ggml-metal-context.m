@@ -239,8 +239,39 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
+        const bool timed = getenv("GGML_METAL_TIME") != NULL;
+        const double tw0 = timed ? (ggml_time_us()*1e-6) : 0.0;
         [ctx->cmd_buf_last waitUntilCompleted];
+        if (timed) {
+            fprintf(stderr, "metal_time: sync wait %.2f ms\n", ((ggml_time_us()*1e-6) - tw0)*1e3);
+        }
         ctx->cmd_buf_last = nil;
+    }
+
+    if (getenv("GGML_METAL_TIME") != NULL) {
+        double t_gpu = 0.0;
+        double t0 = 1e30, t1 = 0.0;
+        for (int cb_idx = 0; cb_idx <= ctx->n_cb; ++cb_idx) {
+            id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+            if (!cmd_buf || [cmd_buf status] != MTLCommandBufferStatusCompleted) {
+                continue;
+            }
+            t_gpu += cmd_buf.GPUEndTime - cmd_buf.GPUStartTime;
+            t0 = MIN(t0, cmd_buf.GPUStartTime);
+            t1 = MAX(t1, cmd_buf.GPUEndTime);
+        }
+        for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
+            id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
+            if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
+                continue;
+            }
+            t_gpu += cmd_buf.GPUEndTime - cmd_buf.GPUStartTime;
+            t0 = MIN(t0, cmd_buf.GPUStartTime);
+            t1 = MAX(t1, cmd_buf.GPUEndTime);
+        }
+        if (t1 > 0.0) {
+            fprintf(stderr, "metal_time: gpu busy %.2f ms, span %.2f ms\n", t_gpu*1e3, (t1 - t0)*1e3);
+        }
     }
 
     // check status of all command buffers
@@ -436,6 +467,8 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    const bool m1_timed = getenv("GGML_METAL_TIME") != NULL;
+    const double m1_t0  = m1_timed ? (ggml_time_us()*1e-6) : 0.0;
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
@@ -548,6 +581,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        if (m1_timed) {
+            fprintf(stderr, "metal_time: encode %.2f ms (%d nodes, n_cb %d)\n",
+                    ((ggml_time_us()*1e-6) - m1_t0)*1e3, gf->n_nodes, n_cb);
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];

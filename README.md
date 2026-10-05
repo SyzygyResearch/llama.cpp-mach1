@@ -60,6 +60,24 @@ The multimodal variant pairs the same language GGUF with a projector file — ge
 
 `llama-server` takes the same `--mmproj` flag and accepts images through the OpenAI-compatible `image_url` content part.
 
+## Qwen3.8-Flash-Next
+
+[SyzygyResearch/Mach-1-Additive-Qwen3.8-Flash-Next-GGUF](https://huggingface.co/SyzygyResearch/Mach-1-Additive-Qwen3.8-Flash-Next-GGUF) is Qwen3.8-Flash-Next at 1.7 bits per weight: one 130 GB file holding 26.7 GB of weights and the model's 102 GB n-gram embedding table. Build with CUDA, then:
+
+```sh
+./build/bin/llama-cli -hf SyzygyResearch/Mach-1-Additive-Qwen3.8-Flash-Next-GGUF -ngl 99 -fa on --mlock \
+  --temp 1.0 --top-p 0.95 --top-k 20
+
+./build/bin/llama-server -m Mach-1-Additive-Qwen3.8-Flash-Next.mach1.gguf -ngl 99 -fa on --mlock -c 32768 --jinja \
+  --temp 1.0 --top-p 0.95 --top-k 20
+```
+
+- The weights go to the GPU, so it needs 32 GB of VRAM or more.
+- The n-gram table stays in host RAM and is read a few rows per token, so the machine needs about 105 GB of free RAM.
+- `--mlock` keeps the table resident. Without it the table is memory-mapped, and pages the OS drops are read back from disk during generation. Locking needs `ulimit -l unlimited` (or root).
+- Sample at temperature 1.0, top_p 0.95, top_k 20, or the model can loop.
+- The fast decode path is CUDA. AMD builds with HIP run the codec ops on the CPU.
+
 ## Notes
 
 - Mach-1 checkpoints need these builds — stock llama.cpp cannot load them, and `llama-quantize` refuses them by design (the weights are already packed code streams).

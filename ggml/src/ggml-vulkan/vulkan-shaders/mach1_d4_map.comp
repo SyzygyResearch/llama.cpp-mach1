@@ -1,0 +1,75 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+#define MAX_E 1024u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n_expert;
+    uint n_used;
+    uint n_pairs;
+    uint map_off;
+    uint ids_s0;
+    uint ids_s1;
+};
+
+layout(binding = 0) readonly buffer IBuf { int ids[]; };
+layout(binding = 1) buffer MBuf { int scr_i[]; };
+
+shared int cnt[MAX_E];
+shared int chk[WG];
+
+int id_at(const uint p) {
+    return ids[(p % n_used)*ids_s0 + (p / n_used)*ids_s1];
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint e = tid; e < n_expert; e += WG) {
+        cnt[e] = 0;
+    }
+    barrier();
+    for (uint c0 = 0u; c0 < n_pairs; c0 += WG) {
+        chk[tid] = c0 + tid < n_pairs ? id_at(c0 + tid) : -1;
+        barrier();
+        const uint nc = min(WG, n_pairs - c0);
+        for (uint e = tid; e < n_expert; e += WG) {
+            int c = 0;
+            for (uint k = 0u; k < nc; ++k) {
+                c += chk[k] == int(e) ? 1 : 0;
+            }
+            cnt[e] += c;
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        int acc = 0;
+        for (uint e = 0u; e < n_expert; ++e) {
+            const int c = cnt[e];
+            scr_i[map_off + e] = acc;
+            cnt[e] = acc;
+            acc += c;
+        }
+        scr_i[map_off + n_expert] = acc;
+    }
+    barrier();
+    for (uint c0 = 0u; c0 < n_pairs; c0 += WG) {
+        chk[tid] = c0 + tid < n_pairs ? id_at(c0 + tid) : -1;
+        barrier();
+        const uint nc = min(WG, n_pairs - c0);
+        for (uint e = tid; e < n_expert; e += WG) {
+            int o = cnt[e];
+            for (uint k = 0u; k < nc; ++k) {
+                if (chk[k] == int(e)) {
+                    scr_i[map_off + n_expert + 1u + uint(o)] = int(c0 + k);
+                    o++;
+                }
+            }
+            cnt[e] = o;
+        }
+        barrier();
+    }
+}

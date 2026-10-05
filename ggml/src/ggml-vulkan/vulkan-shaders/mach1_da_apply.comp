@@ -1,0 +1,45 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint nb;
+    uint n;
+    uint m;
+    uint x_off;
+    uint y_off;
+    uint acc;
+};
+
+layout(binding = 0) readonly buffer FBuf { float scr[]; };
+layout(binding = 1) readonly buffer XBuf { float x[]; };
+layout(binding = 2) buffer DstBuf { float dst[]; };
+
+shared float red[WG];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+
+    float sum = 0.0f;
+    for (uint i = tid; i < nb; i += WG) {
+        sum += scr[row*nb + i] * x[t*n + x_off + i];
+    }
+    red[tid] = sum;
+    barrier();
+    [[unroll]] for (uint s = WG/2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        const uint o = t*m + y_off + row;
+        dst[o] = acc != 0u ? dst[o] + red[0] : red[0];
+    }
+}

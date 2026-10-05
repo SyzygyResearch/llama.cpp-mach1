@@ -104,6 +104,7 @@
 #define FC_SUM_ROWS                    1400
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
+#define FC_MACH1                       1700
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -1209,6 +1210,176 @@ typedef struct {
      int64_t ne00;
     uint64_t nb01;
 } ggml_metal_kargs_argmax;
+
+typedef struct {
+    int32_t rows;
+    float   scale;
+} ggml_metal_kargs_mach1_da_pack;
+
+typedef struct {
+    int32_t words;
+    int32_t mode;
+    int32_t total;
+} ggml_metal_kargs_mach1_da_sexp;
+
+typedef struct {
+    int32_t nb;
+    int32_t n;
+    int32_t nt;
+    int32_t e0;
+    int32_t split;
+} ggml_metal_kargs_mach1_da_ustage;
+
+typedef struct {
+    int32_t words;
+    int32_t mode;
+    int32_t Mb;
+    int32_t Nb;
+    int32_t gl;
+    int32_t nb;
+    int32_t nt;
+    int32_t e0;
+    int32_t stage;
+    float   scale;
+} ggml_metal_kargs_mach1_da_walk;
+
+typedef struct {
+    int32_t mb;
+    int32_t m;
+    int32_t nt;
+    int32_t E;
+    int32_t e0;
+    int32_t split;
+    int32_t omode;
+} ggml_metal_kargs_mach1_da_redout;
+
+typedef struct {
+    int32_t mb;
+    int32_t E;
+    int32_t total;
+} ggml_metal_kargs_mach1_da_outsum;
+
+typedef struct {
+    int32_t d;
+    int32_t span;
+} ggml_metal_kargs_mach1_da_bfly;
+
+typedef struct {
+    int32_t d;
+    int32_t M;
+    int32_t m;
+    int32_t nt;
+    int32_t e0;
+    int32_t split;
+} ggml_metal_kargs_mach1_da_rradix;
+
+typedef struct {
+    int32_t n;
+    int32_t m;
+    int32_t nt;
+    int32_t n_exc;
+    int32_t exc_base;
+} ggml_metal_kargs_mach1_da_exc;
+
+typedef struct {
+    int32_t words;
+    int32_t mode;
+    int32_t Mb;
+    int32_t Nb;
+    int32_t total;
+    int32_t gl;
+    int32_t e;
+    float   scale;
+} ggml_metal_kargs_mach1_da_dec;
+
+typedef struct {
+    int32_t d;
+    int32_t vstride;
+    int32_t gstride;
+} ggml_metal_kargs_mach1_da_fwht_sc;
+
+typedef struct {
+    int32_t E;
+    int32_t mb;
+    int32_t nt;
+} ggml_metal_kargs_mach1_da_embed_mask;
+
+typedef struct {
+    int32_t e;
+    int32_t mb;
+    int32_t nb;
+} ggml_metal_kargs_mach1_da_embed_copy;
+
+typedef struct {
+    int32_t bits;
+    int32_t n;
+    int32_t m;
+    int32_t ntok;
+    int32_t ngr;
+    int32_t grp;
+} ggml_metal_kargs_mach1_int_mm;
+
+typedef struct {
+    int32_t d;
+    int32_t n_used;
+    int32_t xne1;
+    int32_t ids_nb0;
+    int32_t ids_nb1;
+} ggml_metal_kargs_mach1_d4_stage;
+
+typedef struct {
+    int32_t n_expert;
+    int32_t n_used;
+    int32_t n_pairs;
+    int32_t ids_nb0;
+    int32_t ids_nb1;
+} ggml_metal_kargs_mach1_d4_map;
+
+typedef struct {
+    int32_t n;
+    int32_t Mb;
+    int32_t Nb;
+    int32_t n_used;
+    int32_t n_expert;
+    int32_t ids_nb0;
+    int32_t ids_nb1;
+    int32_t grouped;
+    int32_t stage;
+    int32_t hash[15];
+} ggml_metal_kargs_mach1_d4_walk;
+
+typedef struct {
+    int32_t d;
+    int32_t nt;
+    int32_t omode;
+} ggml_metal_kargs_mach1_rt_stage;
+
+typedef struct {
+    int32_t d;
+    int32_t M;
+    int32_t omode;
+    int32_t tr;
+} ggml_metal_kargs_mach1_rt_qfin;
+
+typedef struct {
+    int32_t n;
+    int32_t Mb;
+    int32_t Nb;
+    int32_t nt;
+    int32_t stage;
+} ggml_metal_kargs_mach1_rt_walk;
+
+typedef struct {
+    int32_t n;
+    int32_t m;
+    int32_t nt;
+} ggml_metal_kargs_mach1_head_mm;
+
+typedef struct {
+    int32_t n;
+    int32_t nt;
+    int32_t n_vocab;
+} ggml_metal_kargs_mach1_embed_gather;
 
 typedef struct {
     int64_t  np;

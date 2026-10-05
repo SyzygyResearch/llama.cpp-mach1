@@ -299,6 +299,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35moe(params);
         case LLM_ARCH_MACH1:
             return new llama_model_mach1(params);
+        case LLM_ARCH_QWEN4EXP:
+            return new llama_model_qwen4exp(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
@@ -341,7 +343,7 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     // budget all key off it) and only the model class changes, because the
     // codec replaces how weights are stored, not what the model is. Legacy
     // checkpoints declaring the "mach1" architecture take the switch below.
-    if (ml.has_mach1_codec && arch != LLM_ARCH_MACH1) {
+    if (ml.has_mach1_codec && arch != LLM_ARCH_MACH1 && arch != LLM_ARCH_QWEN4EXP) {
         if (arch != LLM_ARCH_QWEN35MOE) {
             throw std::runtime_error(
                 std::string("mach1 codec checkpoint on unsupported base architecture '") +
@@ -350,6 +352,16 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
         llama_model * model = new llama_model_mach1(params);
         model->arch = arch;
         return model;
+    }
+
+    if (arch == LLM_ARCH_MACH1) {
+        uint32_t m1_ver = 0;
+        ml.get_key("mach1.format_version", m1_ver, false);
+        if (m1_ver == 4) {
+            llama_model * model = new llama_model_mach1_dense(params);
+            model->arch = arch;
+            return model;
+        }
     }
 
     return llama_model_create(arch, params);
@@ -2139,7 +2151,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+                    } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP) {
                         filter_attn = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il);
                         };
@@ -2594,6 +2606,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_MACH1:
             return LLAMA_ROPE_TYPE_IMROPE;
 
+        case LLM_ARCH_QWEN4EXP:
+            return LLAMA_ROPE_TYPE_NEOX;
+
         case LLM_ARCH_GLM4:
             return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NORM;
         case LLM_ARCH_GLM4_MOE:
@@ -2771,6 +2786,17 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
     return create_tensor(*ml, tn, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_tensor_for_layer(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int il) {
+    GGML_ASSERT(ml != nullptr);
+    if (il < 0) {
+        return create_tensor(*ml, tn, ne, TENSOR_DUPLICATED);
+    }
+    const buft_list_t * buft_list_layer = pimpl->dev_layer.at(il).buft_list;
+    return ml->create_tensor(
+        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, buft_list_layer, buft_list_layer,
+        tn, ne, TENSOR_DUPLICATED);
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {

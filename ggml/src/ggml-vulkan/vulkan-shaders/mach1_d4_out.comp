@@ -1,0 +1,43 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint d;
+    uint n_used;
+    uint xne1;
+    uint off;
+    uint ids_s0;
+    uint ids_s1;
+};
+
+layout(binding = 0) readonly buffer SvBuf { float16_t sv[]; };
+layout(binding = 1) readonly buffer IBuf  { int ids[]; };
+layout(binding = 2) readonly buffer FBuf  { float scr[]; };
+layout(binding = 3) writeonly buffer DstBuf { float dst[]; };
+
+shared float sh[4096];
+
+#include "mach1_d4_fwht.glsl"
+
+void main() {
+    const uint s   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint p   = t*n_used + s;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint e   = uint(ids[s*ids_s0 + t*ids_s1]);
+
+    for (uint i = tid; i < d; i += WG) {
+        sh[i] = scr[off + p*d + i];
+    }
+    barrier();
+    mach1_d4_fwht(d, tid);
+    for (uint i = tid; i < d; i += WG) {
+        dst[p*d + i] = sh[i] * float(sv[e*d + i]);
+    }
+}

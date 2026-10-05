@@ -73,12 +73,21 @@ void llama_model_mach1::load_arch_tensors(llama_model_loader & ml) {
     // (I8/I16/I32/F16), so a payload this build predates would not trip any
     // type check - it would be silently misread as v2/v3 bytes. Reject it
     // here instead, with the version in the message.
-    constexpr uint32_t M1_FORMAT_VERSION_MAX = 3;
+    constexpr uint32_t M1_FORMAT_VERSION_MAX = 5;
     if (m1_version > M1_FORMAT_VERSION_MAX) {
         throw std::runtime_error(format(
             "mach1 checkpoint declares format_version %u; this build supports up to %u "
             "- use a newer fork build", m1_version, M1_FORMAT_VERSION_MAX));
     }
+    if (m1_version == 4) {
+        throw std::runtime_error("mach1: format_version 4 is the dense payload, not a qwen35moe checkpoint");
+    }
+
+    auto shared_at = [&](const ggml_tensor * g, const LLM_TN_IMPL & t, int il) -> ggml_tensor * {
+        GGML_ASSERT(g != nullptr);
+        return ggml_n_dims(g) == 1 ? create_tensor_for_layer(t, { g->ne[0] }, il)
+                                   : create_tensor_for_layer(t, { g->ne[0], g->ne[1] }, il);
+    };
 
     // n_in/n_out are the dense widths of the projection the stream decodes to
     auto create_m1_ne = [&](llm_tensor base, int il, int64_t n_in, int64_t n_out) -> m1_ne {
@@ -87,6 +96,7 @@ void llama_model_mach1::load_arch_tensors(llama_model_loader & ml) {
             w.rt_trellis = create_m1(tn(base, "m1_rt_trellis", il), true);
             w.rt_su      = create_m1(tn(base, "m1_rt_su",      il), true);
             w.rt_sv      = create_m1(tn(base, "m1_rt_sv",      il), true);
+            w.rt_tlut    = shared_at(m1_ne_tlut, tn(LLM_TENSOR_MACH1_NE_TLUT), il);
             check_m1_dim(w.rt_su, 0, n_in);
             check_m1_dim(w.rt_sv, 0, n_out);
             return w;
@@ -102,12 +112,29 @@ void llama_model_mach1::load_arch_tensors(llama_model_loader & ml) {
     m1_layers.resize(n_layer);
 
     // global: shared expert trellis codebook + packed embedding + packed lm_head
-    m1_tlut = create_m1(tn(LLM_TENSOR_MACH1_TLUT), true);
+    if (m1_version >= 5) {
+        m1_d4_zt    = create_m1(tn(LLM_TENSOR_MACH1_TLUT, "m1_d4_zt"),    true);
+        m1_d4_units = create_m1(tn(LLM_TENSOR_MACH1_TLUT, "m1_d4_units"), true);
+        check_m1_dim(m1_d4_zt, 0, 65536);
+        check_m1_dim(m1_d4_zt, 1, 5);
+        check_m1_dim(m1_d4_units, 0, 5);
+        if (ml.get_arr("mach1.expert.hash", m1_d4_hash, false) && m1_d4_hash.size() != 15) {
+            throw std::runtime_error("mach1: mach1.expert.hash must be 15 int32");
+        }
+    } else {
+        m1_tlut = create_m1(tn(LLM_TENSOR_MACH1_TLUT), true);
+    }
 
     if (m1_version >= 3) {
         m1_ne_tlut    = create_m1(tn(LLM_TENSOR_MACH1_NE_TLUT), true);
-        m1_embed_codes = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_codes"), true);
-        m1_embed_lut   = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_lut"),   true);
+        const bool stock_embd = m1_version >= 5 &&
+            ml.get_tensor_meta(tn(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str()) != nullptr;
+        if (stock_embd) {
+            tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+        } else {
+            m1_embed_codes = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_codes"), true);
+            m1_embed_lut   = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_lut"),   true);
+        }
     } else {
         m1_embed_q  = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_q"),  true);
         m1_embed_mn = create_m1(tn(LLM_TENSOR_TOKEN_EMBD, "m1_mn"), true);
@@ -132,6 +159,13 @@ void llama_model_mach1::load_arch_tensors(llama_model_loader & ml) {
     for (int il = 0; il < n_layer; ++il) {
         auto & layer = layers[il];
         auto & m1l   = m1_layers[il];
+        if (m1_d4_zt) {
+            m1l.d4_zt    = shared_at(m1_d4_zt,    tn(LLM_TENSOR_MACH1_TLUT, "m1_d4_zt"),    il);
+            m1l.d4_units = shared_at(m1_d4_units, tn(LLM_TENSOR_MACH1_TLUT, "m1_d4_units"), il);
+        }
+        if (m1_tlut) {
+            m1l.tlut     = shared_at(m1_tlut,     tn(LLM_TENSOR_MACH1_TLUT),                il);
+        }
 
         const int64_t n_ff_exp   = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
@@ -173,6 +207,22 @@ void llama_model_mach1::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
             layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
+        } else if (m1_version >= 5) {
+            const llm_tensor exps[3] = { LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_UP_EXPS, LLM_TENSOR_FFN_DOWN_EXPS };
+            for (int p = 0; p < 3; ++p) {
+                auto & e = m1l.exps[p];
+                e.d4_trellis = create_m1(tn(exps[p], "m1_d4_trellis", il), true);
+                e.d4_offs    = create_m1(tn(exps[p], "m1_d4_offs",    il), true);
+                e.su         = create_m1(tn(exps[p], "m1_su",         il), true);
+                e.sv         = create_m1(tn(exps[p], "m1_sv",         il), true);
+                e.d4_gw      = create_m1(tn(exps[p], "m1_d4_gw",      il), true);
+                const int64_t w_in  = p == 2 ? n_ff_exp : n_embd;
+                const int64_t w_out = p == 2 ? n_embd   : n_ff_exp;
+                check_m1_dim(e.su, 0, w_in);
+                check_m1_dim(e.sv, 0, w_out);
+                check_m1_dim(e.d4_offs, 1, n_expert);
+                check_m1_dim(e.d4_gw, 0, w_in/16 + w_out/16);
+            }
         } else {
             m1l.remap = create_m1(tn(LLM_TENSOR_FFN_GATE_INP, "m1_remap", il), true);
             check_m1_dim(m1l.remap, 0, n_expert);
@@ -235,7 +285,7 @@ ggml_tensor * llama_model_mach1::graph::ne_mm(const m1_ne & w, ggml_tensor * x) 
         x = ggml_cont(ctx0, x);
     }
     if (w.rt_trellis) {   // payload v3: rotated int-lattice spine
-        return ggml_mach1_rt_mm(ctx0, w.rt_trellis, w.rt_su, w.rt_sv, model.m1_ne_tlut, x);
+        return ggml_mach1_rt_mm(ctx0, w.rt_trellis, w.rt_su, w.rt_sv, w.rt_tlut, x);
     }
     return ggml_mach1_ne_mm(ctx0, w.packed, w.gscale, w.lut, x);
 }
@@ -274,7 +324,9 @@ ggml_tensor * llama_model_mach1::graph::build_inp_embd_mach1() {
     ggml_set_input(inp->embd);
 
     std::array<ggml_tensor *, 2> inps;
-    inps[0] = model.m1_embed_codes
+    inps[0] = model.tok_embd
+        ? ggml_get_rows(ctx0, model.tok_embd, inp->tokens)
+        : model.m1_embed_codes
         ? ggml_mach1_embed_gather(ctx0, model.m1_embed_codes, model.m1_embed_lut, inp->tokens)
         : ggml_mach1_embed_rows(ctx0, model.m1_embed_q, model.m1_embed_mn, model.m1_embed_mx, inp->tokens);
     inps[1] = inp->embd;
@@ -810,8 +862,13 @@ ggml_tensor * llama_model_mach1::graph::build_layer_ffn(ggml_tensor * cur, const
             if (!ggml_is_contiguous(xin)) {
                 xin = ggml_cont(ctx0, xin);
             }
+            if (e.d4_trellis) {
+                return ggml_mach1_d4_mm(ctx0, e.d4_trellis, e.d4_offs, e.su, e.sv, e.d4_gw,
+                                        m1l.d4_zt, m1l.d4_units, selected_experts, xin,
+                                        model.m1_d4_hash.empty() ? nullptr : model.m1_d4_hash.data());
+            }
             ggml_tensor * out = ggml_mach1_exp_mm(ctx0,
-                e.kept_trellis, e.dem_trellis, e.su, e.sv, model.m1_tlut,
+                e.kept_trellis, e.dem_trellis, e.su, e.sv, m1l.tlut,
                 m1l.remap, selected_experts, xin, e.wave_gamma);
             if (e.basis_a) {
                 // fused acc form: dst = out + basis (no separate ggml_add node)

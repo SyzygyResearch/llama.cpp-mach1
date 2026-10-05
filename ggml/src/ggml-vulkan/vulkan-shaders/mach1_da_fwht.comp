@@ -1,0 +1,115 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define WG 256u
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint d;
+    uint vstride;
+    uint gstride;
+    uint sc_off;
+    uint mask_off;
+};
+
+layout(binding = 0) readonly buffer ScBuf { float16_t scale[]; };
+layout(binding = 1) buffer FBuf { float scr[]; };
+
+shared float sh[8192];
+
+const int HR12[144] = int[144](
+     1, -1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+    -1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,
+     1,  1,  1, -1,  1,  1, -1, -1, -1, -1,  1,  1,
+     1, -1, -1, -1,  1, -1, -1,  1, -1,  1,  1, -1,
+     1,  1,  1,  1,  1, -1,  1,  1, -1, -1, -1, -1,
+     1, -1,  1, -1, -1, -1,  1, -1, -1,  1, -1,  1,
+     1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1,
+     1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1,
+     1,  1, -1, -1, -1, -1,  1,  1,  1, -1,  1,  1,
+     1, -1, -1,  1, -1,  1,  1, -1, -1, -1,  1, -1,
+     1,  1,  1,  1, -1, -1, -1, -1,  1,  1,  1, -1,
+     1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1, -1
+);
+
+const int HR20[400] = int[400](
+     1, -1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+    -1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,
+     1,  1,  1, -1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1,
+     1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,
+     1,  1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1,
+     1, -1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1,
+     1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1,
+     1, -1,  1, -1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1,
+     1,  1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1,
+     1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,
+     1,  1, -1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1,
+     1, -1, -1,  1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1,  1,
+     1,  1, -1, -1, -1, -1,  1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1,
+     1, -1, -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1,
+     1,  1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1,
+     1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1,  1, -1,
+     1,  1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1,
+     1, -1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1,
+     1,  1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1,  1,  1,  1,  1,  1, -1,
+     1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1
+);
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    if (mask_off != 0xFFFFFFFFu && scr[mask_off] == 0.0f) {
+        return;
+    }
+    uint radix = 1u;
+    if ((d & (d - 1u)) != 0u) {
+        const uint m12 = d/12u;
+        radix = (d % 12u == 0u && (m12 & (m12 - 1u)) == 0u) ? 12u : 20u;
+    }
+    const uint M  = d/radix;
+    const uint gb = gl_WorkGroupID.x*gstride;
+
+    for (uint i = tid; i < d; i += WG) {
+        sh[i] = scr[gb + i*vstride];
+    }
+    barrier();
+    for (uint span = 1u; span < M; span <<= 1) {
+        for (uint b = tid; b < d/2u; b += WG) {
+            const uint base = (b / span)*(span << 1) + (b % span);
+            const float a0 = sh[base];
+            const float a1 = sh[base + span];
+            sh[base]        = a0 + a1;
+            sh[base + span] = a0 - a1;
+        }
+        barrier();
+    }
+    const float scm = sqrt(float(M));
+    for (uint i = tid; i < d; i += WG) {
+        sh[i] = sh[i] / scm;
+    }
+    barrier();
+    if (radix > 1u) {
+        const float rs = sqrt(float(radix));
+        for (uint b = tid; b < M; b += WG) {
+            float t[20];
+            for (uint a = 0; a < radix; ++a) {
+                float acc = 0.0f;
+                for (uint c = 0; c < radix; ++c) {
+                    const float hv = radix == 12u ? float(HR12[a*12u + c])
+                                                  : float(HR20[a*20u + c]);
+                    acc += hv * sh[c*M + b];
+                }
+                t[a] = acc / rs;
+            }
+            for (uint a = 0; a < radix; ++a) {
+                sh[a*M + b] = t[a];
+            }
+        }
+        barrier();
+    }
+    for (uint i = tid; i < d; i += WG) {
+        scr[gb + i*vstride] = sh[i] * float(scale[sc_off + i]);
+    }
+}

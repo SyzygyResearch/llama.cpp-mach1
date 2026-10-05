@@ -1,0 +1,74 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define TOK_TILE 8u
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint bits;
+    uint n;
+    uint m;
+    uint n_tokens;
+    uint ngr;
+    uint grp;
+};
+
+layout(binding = 0) readonly buffer QBuf   { uint      qp[]; };
+layout(binding = 1) readonly buffer MnBuf  { float16_t mn[]; };
+layout(binding = 2) readonly buffer MxBuf  { float16_t mx[]; };
+layout(binding = 3) readonly buffer XBuf   { float     x[]; };
+layout(binding = 4) writeonly buffer DstBuf { float dst[]; };
+
+uint q_byte(uint i) {
+    return (qp[i >> 2] >> ((i & 3u)*8u)) & 0xFFu;
+}
+
+void main() {
+    const uint r = gl_GlobalInvocationID.x;
+    if (r >= m) {
+        return;
+    }
+    const uint jt0 = gl_WorkGroupID.y * TOK_TILE;
+    const uint njt = min(TOK_TILE, n_tokens - jt0);
+
+    const uint  row_bytes = n*bits/8u;
+    const uint  cmask     = (1u << bits) - 1u;
+    const float denom     = float((1u << bits) - 1u);
+
+    float accs[TOK_TILE];
+    [[unroll]] for (uint j = 0; j < TOK_TILE; ++j) {
+        accs[j] = 0.0f;
+    }
+
+    const uint pb = r*row_bytes;
+    for (uint j = 0; j < n; ++j) {
+        const uint bp  = j*bits;
+        const uint by  = bp >> 3;
+        const uint off = bp & 7u;
+        uint qv;
+        if (off + bits > 8u) {
+            qv = (((q_byte(pb + by) << 8) | q_byte(pb + by + 1u)) >> (16u - off - bits)) & cmask;
+        } else {
+            qv = (q_byte(pb + by) >> (8u - off - bits)) & cmask;
+        }
+        const uint  g   = j/grp;
+        const float mnf = float(mn[r*ngr + g]);
+        const float d   = float(mx[r*ngr + g]) - mnf;
+        const float s   = max(d, 1e-8f)/denom;
+        const float pr  = float(qv)*s;
+        const float w   = mnf + pr;
+        [[unroll]] for (uint jt = 0; jt < TOK_TILE; ++jt) {
+            if (jt < njt) {
+                accs[jt] += w * x[(jt0 + jt)*n + j];
+            }
+        }
+    }
+    [[unroll]] for (uint j = 0; j < TOK_TILE; ++j) {
+        if (j < njt) {
+            dst[(jt0 + j)*m + r] = accs[j];
+        }
+    }
+}

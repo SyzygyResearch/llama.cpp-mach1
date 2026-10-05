@@ -4,6 +4,7 @@ import json
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
@@ -688,3 +689,260 @@ class DFlashModel(Qwen3Model):
         if not name.startswith("model."):
             name = "model." + name
         return super().filter_tensors((name, gen))
+
+
+@ModelBase.register("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration")
+class Qwen4ExpTextModel(_LinearAttentionVReorderBase):
+    """Qwen4-Exp text model: GDN + QSA attention, MoE, gated hyper-connections and n-gram PLE."""
+    model_arch = gguf.MODEL_ARCH.QWEN4EXP
+
+    _HC = {
+        "hc_norm":               "NORM",
+        "input_mix_weight_down": "DOWN",
+        "input_mix_weight_up":   "UP",
+        "block_inject_weight":   "INJECT",
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ple_parts: dict[int, dict[int, Tensor]] = {}
+        self._ple_tables: dict[int, list[Tensor]] = {}
+        self._ple_stream: list[Tensor] | None = None
+        self._ple_done = False
+
+    def set_vocab(self):
+        try:
+            self._set_vocab_gpt2()
+        except Exception as e:  # noqa: BLE001 - a random test checkpoint ships no tokenizer
+            logger.warning(f"qwen4exp: no usable tokenizer ({e!r}), writing a vocab-less GGUF")
+            self._set_vocab_none()
+            self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        if name.startswith(("mtp.", "model.mtp.", "model.visual.", "visual.")):
+            return None
+        return super().filter_tensors(item)
+
+    def _ple_layer_ids(self) -> list[int]:
+        return sorted(set(self.hparams.get("ple_layer_ids") or []))
+
+    def set_gguf_parameters(self):
+        hp = self.hparams
+        Qwen2MoeModel.set_gguf_parameters(self)
+        self.gguf_writer.add_ssm_conv_kernel(hp["linear_conv_kernel_dim"])
+        self.gguf_writer.add_ssm_state_size(hp["linear_key_head_dim"])
+        self.gguf_writer.add_ssm_group_count(hp["linear_num_key_heads"])
+        self.gguf_writer.add_ssm_time_step_rank(hp["linear_num_value_heads"])
+        self.gguf_writer.add_ssm_inner_size(hp["linear_value_head_dim"] * hp["linear_num_value_heads"])
+        arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+        self.gguf_writer.add_string(f"{arch}.ssm.output_gate", hp.get("output_gate_type") or hp.get("hidden_act", "silu"))
+
+        n_layer = hp["num_hidden_layers"]
+        layer_types = hp.get("layer_types")
+        if layer_types is None:
+            interval = hp.get("full_attention_interval", 4)
+            layer_types = ["linear_attention" if (i + 1) % interval else "indexed_attention" for i in range(n_layer)]
+        layer_types = layer_types[:n_layer]
+        assert set(layer_types) <= {"linear_attention", "indexed_attention", "full_attention"}, layer_types
+        self.gguf_writer.add_array(f"{arch}.attention.recurrent_layers",
+                                   [1 if t == "linear_attention" else 0 for t in layer_types])
+
+        head_dim = hp.get("head_dim") or hp["hidden_size"] // hp["num_attention_heads"]
+        partial = self.rope_parameters.get("partial_rotary_factor", 1.0)
+        self.gguf_writer.add_rope_dimension_count(int(head_dim * partial))
+
+        self.gguf_writer.add_expert_weights_norm(bool(hp.get("norm_topk_prob", True)))
+
+        assert hp.get("indexer_kv_heads", 1) == 1
+        assert hp["indexer_budget"] % hp["indexer_compress_ratio"] == 0
+        self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
+        self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
+        self.gguf_writer.add_indexer_top_k(hp["indexer_budget"] // hp["indexer_compress_ratio"])
+        self.gguf_writer.add_indexer_block_size(hp["indexer_compress_ratio"])
+
+        self.gguf_writer.add_hyper_connection_count(hp["hc_count"])
+        self.gguf_writer.add_uint32(f"{arch}.hyper_connection.rank", hp["hc_lowrank"])
+
+        ple_ids = self._ple_layer_ids()
+        if ple_ids:
+            eos = hp.get("eos_token_id")
+            eos = eos[0] if isinstance(eos, list) else eos
+            assert eos is not None
+            self.gguf_writer.add_array(f"{arch}.ple.layers", [1 if (i + 1) in ple_ids else 0 for i in range(n_layer)])
+            self.gguf_writer.add_uint32(f"{arch}.ple.embedding_length", hp.get("ple_embed_dim") or hp["hidden_size"])
+            self.gguf_writer.add_uint32(f"{arch}.ple.conv_kernel", hp.get("ple_conv_kernel_size", 4))
+            self.gguf_writer.add_uint32(f"{arch}.ple.ngram_size", hp.get("ngram_size", 3))
+            self.gguf_writer.add_uint32(f"{arch}.ple.heads_per_ngram", hp.get("heads_per_ngram", 8))
+            self.gguf_writer.add_uint32(f"{arch}.ple.vocab_size_base", hp.get("ngram_vocab_size_base", 20_000_000))
+            self.gguf_writer.add_uint32(f"{arch}.ple.vocab_pad", hp.get("make_ngram_vocab_size_divisible_by", 128))
+            self.gguf_writer.add_uint32(f"{arch}.ple.seed", hp.get("seed", 1234))
+            self.gguf_writer.add_uint32(f"{arch}.ple.eos_token_id", eos)
+
+    def _ple_layer_index(self, bid: int) -> int:
+        return self._ple_layer_ids().index(bid + 1)
+
+    def _check_ple_hash(self, bid: int, name: str, data: Tensor):
+        hp = self.hparams
+        idx = self._ple_layer_index(bid)
+        ngram, hpn = hp.get("ngram_size", 3), hp.get("heads_per_ngram", 8)
+        n_heads = (ngram - 1) * hpn
+        if name.endswith("layer_multipliers"):
+            M = (1 << 64) - 1
+            def splitmix(v):
+                v = (v + 0x9E3779B97F4A7C15) & M
+                v = ((v ^ (v >> 30)) * 0xBF58476D1CE4E5B9) & M
+                v = ((v ^ (v >> 27)) * 0x94D049BB133111EB) & M
+                return (v ^ (v >> 31)) & M
+            half = max(1, (((1 << 63) - 1) // max(hp["vocab_size"], 1)) // 2)
+            seed = hp.get("seed", 1234) + 10007 * idx
+            exp = [2 * (splitmix((seed + 0x9E3779B97F4A7C15 * (k + 1)) & M) % half) + 1 for k in range(ngram)]
+            assert all(abs(float(a) - b) <= 1e-6 * b for a, b in zip(data.tolist(), exp)), (name, data.tolist(), exp)
+        elif name.endswith("ngram_heads_vocab_sizes"):
+            def is_prime(v):
+                if v < 2 or v % 2 == 0:
+                    return v == 2
+                d = 3
+                while d * d <= v:
+                    if v % d == 0:
+                        return False
+                    d += 2
+                return True
+            p, sizes = hp.get("ngram_vocab_size_base", 20_000_000) - 1, []
+            for _ in range(idx * n_heads + n_heads):
+                p += 1
+                while not is_prime(p):
+                    p += 1
+                sizes.append(p)
+            assert all(abs(float(a) - b) <= 1e-6 * b for a, b in zip(data.tolist(), sizes[idx * n_heads:])), (name, data.tolist())
+
+    class _PleRowStream:
+        """The concatenated PLE table, materialized one checkpoint shard at a time."""
+
+        _TYPES = {
+            gguf.LlamaFileType.ALL_F32:     (torch.float32,  np.float32, gguf.GGMLQuantizationType.F32),
+            gguf.LlamaFileType.MOSTLY_F16:  (torch.float16,  np.float16, gguf.GGMLQuantizationType.F16),
+            gguf.LlamaFileType.MOSTLY_BF16: (torch.bfloat16, np.uint16,  gguf.GGMLQuantizationType.BF16),
+        }
+
+        def __init__(self, parts: list[Tensor], ftype):
+            self.parts = parts
+            self.tdtype, np_dtype, self.qtype = self._TYPES[ftype]
+            n_cols = int(parts[0].shape[1])
+            assert all(int(p.shape[1]) == n_cols for p in parts)
+            self.shape = (sum(int(p.shape[0]) for p in parts), n_cols)
+            self.dtype = np.dtype(np_dtype)
+            self.nbytes = self.shape[0] * self.shape[1] * self.dtype.itemsize
+
+        def tofile(self, fout) -> None:
+            from .base import LazyTorchTensor
+            while self.parts:
+                part = self.parts.pop(0)
+                t = LazyTorchTensor.to_eager(part) if isinstance(part, LazyTorchTensor) else part
+                t = t.to(self.tdtype).contiguous()
+                (t.view(torch.int16) if self.tdtype == torch.bfloat16 else t).numpy().tofile(fout)
+                del part, t
+
+    def _emit_ple_table(self) -> Iterable[tuple[str, Tensor]]:
+        ple_ids = self._ple_layer_ids()
+        if self._ple_done or len(self._ple_tables) < len(ple_ids):
+            return
+        self._ple_done = True
+        tables = [self._ple_tables.pop(lid - 1) for lid in ple_ids]
+        if self.lazy and self.ftype in self._PleRowStream._TYPES:
+            self._ple_stream = [p for t in tables for p in t]
+            return
+        tables = [t[0] if len(t) == 1 else torch.cat(t, dim=0) for t in tables]
+        data = tables[0] if len(tables) == 1 else torch.cat(tables, dim=0)
+        yield (self.format_tensor_name(gguf.MODEL_TENSOR.PLE_NGRAM_EMBD), data)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        T = gguf.MODEL_TENSOR
+        if name.startswith("model.hyper_connection_mixer."):
+            part = name.split(".")[2]
+            if part == "hc_norm":
+                data_torch = data_torch + 1
+            yield (self.format_tensor_name(getattr(T, f"QHC_OUT_{self._HC[part]}")), data_torch)
+            return
+
+        if bid is None:
+            yield from super().modify_tensors(data_torch, name, bid)
+            return
+
+        pre = f"model.layers.{bid}."
+        rest = name[len(pre):] if name.startswith(pre) else name
+
+        for hc_mod, kind in (("attn_hyper_connection.", "ATTN"), ("mlp_hyper_connection.", "FFN")):
+            if rest.startswith(hc_mod):
+                part = rest[len(hc_mod):].split(".")[0]
+                if part == "hc_norm":
+                    data_torch = data_torch + 1
+                yield (self.format_tensor_name(getattr(T, f"QHC_{kind}_{self._HC[part]}"), bid), data_torch)
+                return
+
+        if rest == "self_attn.indexer.index_qk_proj.weight":
+            n_q = self.hparams["indexer_n_heads"] * self.hparams["indexer_head_dim"]
+            yield (self.format_tensor_name(T.INDEXER_Q_PROJ, bid), data_torch[:n_q].contiguous())
+            yield (self.format_tensor_name(T.INDEXER_K_PROJ, bid), data_torch[n_q:].contiguous())
+            return
+        if rest in ("self_attn.indexer.q_layernorm.weight", "self_attn.indexer.k_layernorm.weight"):
+            key = T.INDEXER_Q_NORM if ".q_layernorm" in rest else T.INDEXER_K_NORM
+            yield (self.format_tensor_name(key, bid), data_torch + 1)
+            return
+
+        if rest.startswith("ple."):
+            sub = rest[len("ple."):]
+            if sub.startswith("ple_embedding."):
+                leaf = sub[len("ple_embedding."):]
+                if leaf in ("layer_multipliers", "ngram_heads_vocab_sizes"):
+                    self._check_ple_hash(bid, leaf, data_torch)
+                    return
+                if leaf == "ngram_heads_offsets":
+                    return
+                if leaf == "ngram_embedding.weight":
+                    self._ple_tables[bid] = [data_torch]
+                elif leaf.startswith("ngram_embedding.shard_"):
+                    parts = self._ple_parts.setdefault(bid, {})
+                    parts[int(leaf.split(".")[1].removeprefix("shard_"))] = data_torch
+                    n_parts = self.hparams.get("split_ngram_parts", 512)
+                    if len(parts) < n_parts:
+                        return
+                    self._ple_tables[bid] = [parts[i] for i in range(n_parts)]
+                    del self._ple_parts[bid]
+                else:
+                    raise ValueError(f"unexpected PLE tensor {name}")
+                yield from self._emit_ple_table()
+                return
+            if sub == "conv1d.weight":
+                yield (self.format_tensor_name(T.PLE_CONV1D, bid), data_torch.squeeze(1).transpose(0, 1).contiguous())
+                return
+            ple_map = {
+                "key_proj.weight":   (T.PLE_KEY_PROJ,   False),
+                "value_proj.weight": (T.PLE_VALUE_PROJ, False),
+                "norm_key.weight":   (T.PLE_KEY_NORM,   True),
+                "norm_query.weight": (T.PLE_QUERY_NORM, True),
+                "norm_conv.weight":  (T.PLE_CONV_NORM,  True),
+            }
+            key, plus_one = ple_map[sub]
+            yield (self.format_tensor_name(key, bid), data_torch + 1 if plus_one else data_torch)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if bid is not None and self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.PLE_CONV1D, bid):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._ple_stream is not None:
+            st = self._PleRowStream(self._ple_stream, self.ftype)
+            self._ple_stream = None
+            name = self.format_tensor_name(gguf.MODEL_TENSOR.PLE_NGRAM_EMBD)
+            logger.info(f"{name + ',':<32} streamed {st.qtype.name}, shape = {{{st.shape[1]}, {st.shape[0]}}}")
+            self.gguf_writer.add_tensor(name, st, raw_shape=st.shape, raw_dtype=st.qtype)  # type: ignore[arg-type]
+        if self._ple_layer_ids() and not self._ple_done:
+            raise ValueError(f"qwen4exp: PLE tables incomplete: have {sorted(self._ple_tables)}, "
+                             f"pending shards {[(b, len(p)) for b, p in self._ple_parts.items()]}")

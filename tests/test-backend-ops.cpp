@@ -4093,6 +4093,17 @@ struct test_rwkv_wkv6 : public test_case {
 // the reference decoder) are the comparison baseline.
 #define MACH1_TEST_DEM_FLAG (1 << 30)
 
+static void init_mach1_lattice_tlut(ggml_tensor * t) {
+    std::mt19937 rng(4242);
+    std::uniform_int_distribution<int> lv(-5, 4);
+    const float scale = 0.8963924050331116f;
+    std::vector<float> data(ggml_nelements(t));
+    for (float & v : data) {
+        v = scale*(float) lv(rng);
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+}
+
 static void init_mach1_random_bytes(ggml_tensor * t) {
     std::vector<uint8_t> data(ggml_nbytes(t));
     for (size_t i = 0; i < data.size(); i++) {
@@ -4263,6 +4274,95 @@ struct test_mach1_exp_mm : public test_mach1_exp_common {
     }
 };
 
+struct test_mach1_d4_mm : public test_case {
+    const int64_t m, n, n_exp, n_used, n_tok;
+    const bool per_slot_x;
+    const bool hashed;
+    int32_t hash[15];
+
+    test_mach1_d4_mm(int64_t m = 64, int64_t n = 128, int64_t n_exp = 5, int64_t n_used = 2, int64_t n_tok = 3,
+            bool per_slot_x = false, bool hashed = false)
+        : m(m), n(n), n_exp(n_exp), n_used(n_used), n_tok(n_tok), per_slot_x(per_slot_x), hashed(hashed) {
+        for (int r = 0; r < 5; ++r) {
+            uint32_t w0 = 0, w1 = 0;
+            for (int k = 0; k < 8; ++k) {
+                w0 |= (uint32_t)((k*5 + r) & 15) << (4*k);
+                w1 |= (uint32_t)((k*7 + 3*r + 1) & 15) << (4*k);
+            }
+            hash[3*r + 0] = (int32_t)(r % 2 ? 0x9E3779B1u : 0x27D4EB2Fu);
+            hash[3*r + 1] = (int32_t) w0;
+            hash[3*r + 2] = (int32_t) w1;
+        }
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(m, n, n_exp, n_used, n_tok, per_slot_x, hashed);
+    }
+
+    double max_nmse_err() override {
+        return 1e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t ntiles = (m/16)*(n/16);
+        ggml_tensor * trellis = ggml_new_tensor_1d(ctx, GGML_TYPE_I16, n_exp*ntiles*32);
+        ggml_tensor * offs  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_exp);
+        ggml_tensor * su    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, n_exp);
+        ggml_tensor * sv    = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, m, n_exp);
+        ggml_tensor * gw    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m/16 + n/16, n_exp);
+        ggml_tensor * zt    = ggml_new_tensor_2d(ctx, GGML_TYPE_I16, 65536, 5);
+        ggml_tensor * units = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, per_slot_x ? n_used : 1, n_tok);
+        ggml_set_name(offs, "offs");
+        ggml_set_name(ids, "ids");
+        ggml_set_name(zt, "zt");
+        return ggml_mach1_d4_mm(ctx, trellis, offs, su, sv, gw, zt, units, ids, x, hashed ? hash : nullptr);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t ntiles = (m/16)*(n/16);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (hashed && strcmp(t->name, "zt") == 0) {
+                std::vector<uint16_t> data(5*65536);
+                for (int r = 0; r < 5; ++r) {
+                    const uint32_t mult = (uint32_t) hash[3*r];
+                    const uint64_t lv   = (uint64_t)(uint32_t) hash[3*r + 1] | ((uint64_t)(uint32_t) hash[3*r + 2] << 32);
+                    for (uint32_t st = 0; st < 65536; ++st) {
+                        const uint32_t h = (st*mult) >> 16;
+                        uint16_t v = 0;
+                        for (int c = 0; c < 4; ++c) {
+                            const int z = (int)(((lv >> (4*((h >> (4*c)) & 15))) & 15) ^ 8) - 8;
+                            v |= (uint16_t)((z + 8) << (4*c));
+                        }
+                        data[r*65536 + st] = v;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(uint16_t));
+            } else if (t->type == GGML_TYPE_I16) {
+                init_mach1_random_bytes(t);
+            } else if (strcmp(t->name, "offs") == 0) {
+                std::vector<int32_t> data;
+                for (int64_t e = 0; e < n_exp; e++) {
+                    data.push_back((int32_t)(e*ntiles*32));
+                    data.push_back(4 + (int32_t)(e % 5));
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> data(n_used*n_tok);
+                for (int64_t tk = 0; tk < n_tok; tk++) {
+                    for (int64_t s = 0; s < n_used; s++) {
+                        data[tk*n_used + s] = (int32_t)((rand() % (n_exp/n_used))*n_used + s);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_mach1_rt_mm : public test_case {
     const int64_t m, n, words = 64, n_tok;
 
@@ -4345,6 +4445,128 @@ struct test_mach1_embed_gather : public test_case {
                     data[i] = rand() % vocab;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, n_tok*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_mach1_da_mm : public test_case {
+    const int64_t mb, nb, E, words;
+    const int mode, split;
+    const int64_t n_tok;
+    const bool exc;
+    const bool lat;
+
+    test_mach1_da_mm(int64_t mb = 256, int64_t nb = 512, int64_t E = 1, int64_t words = 24,
+                     int mode = 0, int split = 0, int64_t n_tok = 3, bool exc = false, bool lat = false)
+        : mb(mb), nb(nb), E(E), words(words), mode(mode), split(split), n_tok(n_tok), exc(exc), lat(lat) {}
+
+    std::string vars() override {
+        return VARS_TO_STR9(mb, nb, E, words, mode, split, n_tok, exc, lat);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n = split == 1 ? E*nb : nb;
+        ggml_tensor * trellis = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, words, (mb/16)*(nb/16), E);
+        ggml_tensor * su   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, nb, E);
+        ggml_tensor * sv   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mb, E);
+        ggml_tensor * wg   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mb/16 + nb/16, E);
+        ggml_tensor * tlut = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 32768);
+        ggml_set_name(tlut, "tlut");
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tok);
+        ggml_tensor * eidx = nullptr;
+        ggml_tensor * erow = nullptr;
+        if (exc) {
+            eidx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+            erow = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n, 3);
+            ggml_set_name(eidx, "exc_idx");
+        }
+        return ggml_mach1_da_mm(ctx, trellis, su, sv, wg, tlut, x, eidx, erow, mode, split, 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t m = split == 2 ? E*mb : mb;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I16) {
+                init_mach1_random_bytes(t);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data = { 1, (int32_t)(m/2), (int32_t)(m - 1) };
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (lat && strcmp(t->name, "tlut") == 0) {
+                init_mach1_lattice_tlut(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_mach1_int_mm : public test_case {
+    const int bits;
+    const int64_t n, m, g, n_tok;
+
+    test_mach1_int_mm(int bits = 3, int64_t n = 5120, int64_t m = 64, int64_t g = 128, int64_t n_tok = 3)
+        : bits(bits), n(n), m(m), g(g), n_tok(n_tok) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(bits, n, m, g, n_tok);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q  = ggml_new_tensor_2d(ctx, GGML_TYPE_I8,  n*bits/8, m);
+        ggml_tensor * mn = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n/g, m);
+        ggml_tensor * mx = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n/g, m);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tok);
+        return ggml_mach1_int_mm(ctx, q, mn, mx, x, bits);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                init_mach1_random_bytes(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_mach1_da_embed : public test_case {
+    const int64_t mb, nb, E, n_tok;
+    const bool lat;
+
+    test_mach1_da_embed(int64_t mb = 256, int64_t nb = 512, int64_t E = 3, int64_t n_tok = 7, bool lat = false)
+        : mb(mb), nb(nb), E(E), n_tok(n_tok), lat(lat) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(mb, nb, E, n_tok, lat);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * trellis = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 24, (mb/16)*(nb/16), E);
+        ggml_tensor * su   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, nb, E);
+        ggml_tensor * sv   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mb, E);
+        ggml_tensor * wg   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, mb/16 + nb/16, E);
+        ggml_tensor * tlut = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 32768);
+        ggml_set_name(tlut, "tlut");
+        ggml_tensor * ids  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
+        return ggml_mach1_da_embed(ctx, trellis, su, sv, wg, tlut, ids, 1);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I16) {
+                init_mach1_random_bytes(t);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(n_tok);
+                for (int64_t i = 0; i < n_tok; i++) {
+                    data[i] = rand() % (E*mb);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, n_tok*sizeof(int32_t));
+            } else if (lat && strcmp(t->name, "tlut") == 0) {
+                init_mach1_lattice_tlut(t);
             } else {
                 init_tensor_uniform(t);
             }
@@ -9905,6 +10127,45 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mach1_exp_mm(false, true,  64, 128, 1, 0, 2, 8));
     test_cases.emplace_back(new test_mach1_rt_mm());
     test_cases.emplace_back(new test_mach1_rt_mm(64, 128, 8));   // n_tok >= MACH1_RT_BATCH_MIN: batched walk
+    test_cases.emplace_back(new test_mach1_rt_mm(640, 2560, 3));
+    test_cases.emplace_back(new test_mach1_rt_mm(768, 1280, 9));
+    test_cases.emplace_back(new test_mach1_rt_mm(2560, 640, 2));
+    test_cases.emplace_back(new test_mach1_rt_mm(512, 640, 2));
+    test_cases.emplace_back(new test_mach1_rt_mm(640, 512, 2));
+    test_cases.emplace_back(new test_mach1_rt_mm(2560, 10240, 2));
+    test_cases.emplace_back(new test_mach1_rt_mm(10240, 2560, 1));
+    test_cases.emplace_back(new test_mach1_d4_mm());
+    test_cases.emplace_back(new test_mach1_d4_mm(128, 64, 6, 3, 4, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(160, 320, 5, 1, 2));
+    test_cases.emplace_back(new test_mach1_d4_mm(64, 128, 6, 2, 1, false, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(320, 160, 7, 2, 6, true, true));
+    test_cases.emplace_back(new test_mach1_rt_mm(16384, 256, 2));
+
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 1, 24, 0, 0, 3));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 1, 28, 1, 0, 3));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 1, 30, 1, 0, 3));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 320, 1, 24, 0, 0, 3));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 3, 24, 0, 2, 3));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 3, 24, 0, 1, 3));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 1, 24, 0, 0, 3, true));
+    test_cases.emplace_back(new test_mach1_da_mm(1024, 5120, 1, 24, 1, 0, 2));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 3, 24, 0, 1, 8));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 320, 1, 30, 1, 0, 8));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 3, 24, 0, 1, 32));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 3, 24, 1, 2, 32));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 1, 24, 0, 0, 3, false, true));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 3, 24, 0, 1, 3, false, true));
+    test_cases.emplace_back(new test_mach1_da_mm(10240, 512, 1, 24, 0, 0, 2));
+    test_cases.emplace_back(new test_mach1_da_mm(12288, 256, 1, 24, 1, 0, 2));
+    test_cases.emplace_back(new test_mach1_da_mm(10240, 512, 1, 24, 0, 0, 8));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 1, 24, 0, 0, 1));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 512, 3, 24, 0, 1, 1));
+    test_cases.emplace_back(new test_mach1_da_mm(256, 320, 1, 30, 1, 0, 1, false, true));
+    test_cases.emplace_back(new test_mach1_int_mm(3, 5120, 64, 128, 3));
+    test_cases.emplace_back(new test_mach1_int_mm(4, 5120, 64, 128, 3));
+    test_cases.emplace_back(new test_mach1_int_mm(4, 5120, 64, 64, 3));
+    test_cases.emplace_back(new test_mach1_da_embed(256, 512, 3, 7));
+    test_cases.emplace_back(new test_mach1_da_embed(256, 512, 3, 7, true));
     test_cases.emplace_back(new test_mach1_head_mm());
     test_cases.emplace_back(new test_mach1_embed_gather());
     test_cases.emplace_back(new test_mach1_exp_basis(false));
@@ -9987,6 +10248,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    test_cases.emplace_back(new test_mach1_da_mm( 1024, 5120, 17, 24, 0, 2, 1, false, true));
+    test_cases.emplace_back(new test_mach1_da_mm( 5120, 1024, 17, 24, 0, 1, 1, false, true));
+    test_cases.emplace_back(new test_mach1_da_mm(10240, 5120,  1, 24, 1, 0, 1, false, true));
+    test_cases.emplace_back(new test_mach1_da_mm( 6144, 5120,  1, 24, 1, 0, 1, false, true));
+    test_cases.emplace_back(new test_mach1_da_mm( 5120, 6144,  1, 24, 1, 0, 1, false, true));
+    test_cases.emplace_back(new test_mach1_da_mm( 2560, 5120, 93, 28, 1, 2, 1, false, true));
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
@@ -10229,6 +10497,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mach1_rt_mm(2048, 4096, n_tok));   // out proj (assumed)
         test_cases.emplace_back(new test_mach1_rt_mm(2048, 2048, n_tok));   // square proj (assumed)
     }
+    for (int64_t n_tok : {(int64_t) 512, (int64_t) 1}) {
+        test_cases.emplace_back(new test_mach1_d4_mm( 512, 2048, 256,  8, n_tok));
+        test_cases.emplace_back(new test_mach1_d4_mm(2048,  512, 256,  8, n_tok, true));
+        test_cases.emplace_back(new test_mach1_d4_mm( 640, 2560, 512, 10, n_tok));
+        test_cases.emplace_back(new test_mach1_d4_mm(2560,  640, 512, 10, n_tok, true));
+    }
+    test_cases.emplace_back(new test_mach1_d4_mm( 640, 2560, 512, 10, 1, false, true));
+    test_cases.emplace_back(new test_mach1_d4_mm(2560,  640, 512, 10, 1, true,  true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true,   640, 1, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 2560, 1,  640));
     test_cases.emplace_back(new test_mach1_head_mm(2048, 151936, 1));
     test_cases.emplace_back(new test_mach1_head_mm(2048, 151936, 8));
 

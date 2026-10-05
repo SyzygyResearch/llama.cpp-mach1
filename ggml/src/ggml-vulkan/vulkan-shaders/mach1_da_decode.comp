@@ -1,0 +1,67 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint words;
+    uint mode;
+    uint Mb;
+    uint Nb;
+    uint total;
+    uint tr_off;
+    uint gm_off;
+    uint mask_off;
+};
+
+layout(binding = 0) readonly buffer KBuf { uint16_t  trellis[]; };
+layout(binding = 1) readonly buffer TBuf { float     tlut[]; };
+layout(binding = 2) readonly buffer GBuf { float16_t wgamma[]; };
+layout(binding = 3) buffer FBuf { float scr[]; };
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    if (gid >= total) {
+        return;
+    }
+    if (mask_off != 0xFFFFFFFFu && scr[mask_off] == 0.0f) {
+        return;
+    }
+    const uint td = gid >> 5;
+    const uint i  = gid & 31u;
+
+    const uint rb = td / Nb;
+    const uint cb = td % Nb;
+    const uint s  = rb + cb;
+    const uint wv = s <= Nb - 1u ? Mb + Nb - 1u - s : Mb + Nb - 2u - s;
+    const float gsc = float(wgamma[gm_off + wv]);
+
+    const uint tw   = tr_off + td*words;
+    const uint step = words/2u;
+    const uint b    = step*i;
+    const uint wi   = b >> 4;
+    const uint o    = b & 15u;
+    const uint w2   = (uint(trellis[tw + wi]) << 16) |
+                       uint(trellis[tw + (wi + 1u < words ? wi + 1u : 0u)]);
+    const uint reg  = (w2 >> (16u - o)) & 0xFFFFu;
+    const uint p    = reg*(reg + 1u);
+    const uint row  = (mode != 0u ? p >> 1 : p) & 0x7FFFu;
+    const uint ng   = (p >> (mode != 0u ? 16u : 15u)) & 1u;
+
+    const uint ri = (8u*i) >> 4;
+    const uint ci = (8u*i) & 15u;
+    const uint nb = Nb*16u;
+    const uint wo = (rb*16u + ri)*nb + cb*16u + ci;
+    const uint ws = 8u*row;
+    [[unroll]] for (uint c = 0; c < 8u; ++c) {
+        float w = tlut[ws + c];
+        if (c == 0u && ng != 0u) {
+            w = -w;
+        }
+        w *= gsc;
+        scr[wo + c] = float(float16_t(w));
+    }
+}

@@ -12109,7 +12109,7 @@ void ggml_compute_forward_mach1_ne_mm(const struct ggml_compute_params * params,
         }
         for (int64_t j = 0; j < nt; ++j) {
             float sum = 0.0f;
-            ggml_vec_dot_f32((int) T, &sum, 0, wbuf, 0, (float *)(xd + j*T), 0, 1);
+            ggml_vec_dot_f32((int) T, &sum, 0, wbuf, 0, (const float *)(xd + j*T), 0, 1);
             yd[j*B + r] = sum;
         }
     }
@@ -12424,9 +12424,7 @@ static inline void mach1_decode_tile(const uint16_t * tw, int64_t words,
     }
 }
 
-// orthonormal Walsh-Hadamard, Sylvester order: butterfly pairs at stride
-// 1,2,4,... then ONE fp32 division by sqrt(d) — the reference op order
-static void mach1_fwht_f32(float * v, const int64_t d) {
+static void mach1_fwht_bfly_f32(float * v, const int64_t d) {
     for (int64_t span = 1; span < d; span <<= 1) {
 #if defined(__AVX__)
         // A butterfly is elementwise over two disjoint contiguous runs, so the
@@ -12454,6 +12452,10 @@ static void mach1_fwht_f32(float * v, const int64_t d) {
             }
         }
     }
+}
+
+static void mach1_fwht_f32(float * v, const int64_t d) {
+    mach1_fwht_bfly_f32(v, d);
     const float s = sqrtf((float) d);
 #if defined(__AVX__)
     if ((d & 7) == 0) {
@@ -12833,7 +12835,7 @@ void ggml_compute_forward_mach1_exp_mm(const struct ggml_compute_params * params
                 const int64_t t = pairs[2*p + 1];
                 const float * xc = xd + (xne1 == 1 ? 0 : s*n) + t*xne1*n;
                 float sum = 0.0f;
-                ggml_vec_dot_f32((int) n, &sum, 0, (float *) wrow, 0, (float *) xc, 0, 1);
+                ggml_vec_dot_f32((int) n, &sum, 0, (const float *) wrow, 0, (const float *) xc, 0, 1);
                 yd[t*n_used*m + s*m + i] = sum;
             }
         }
@@ -12926,6 +12928,71 @@ void ggml_compute_forward_mach1_exp_basis(const struct ggml_compute_params * par
     }
 }
 
+static const char * const mach1_hadr_rows12[12] = {
+    "+-----------", "++-+---+++-+", "+++-+---+++-", "+-++-+---+++", "++-++-+---++", "+++-++-+---+",
+    "++++-++-+---", "+-+++-++-+--", "+--+++-++-+-", "+---+++-++-+", "++---+++-++-", "+-+---+++-++",
+};
+static const char * const mach1_hadr_rows20[20] = {
+    "+-------------------", "++-++----+-+-++++--+", "+++-++----+-+-++++--", "+-++-++----+-+-++++-",
+    "+--++-++----+-+-++++", "++--++-++----+-+-+++", "+++--++-++----+-+-++", "++++--++-++----+-+-+",
+    "+++++--++-++----+-+-", "+-++++--++-++----+-+", "++-++++--++-++----+-", "+-+-++++--++-++----+",
+    "++-+-++++--++-++----", "+-+-+-++++--++-++---", "+--+-+-++++--++-++--", "+---+-+-++++--++-++-",
+    "+----+-+-++++--++-++", "++----+-+-++++--++-+", "+++----+-+-++++--++-", "+-++----+-+-++++--++",
+};
+
+static const int8_t * mach1_hadr_matrix(int r) {
+    static int8_t h12[12*12], h20[20*20];
+    static std::once_flag once;
+    std::call_once(once, [] {
+        for (int i = 0; i < 12; ++i) {
+            for (int j = 0; j < 12; ++j) {
+                h12[i*12 + j] = mach1_hadr_rows12[i][j] == '+' ? 1 : -1;
+            }
+        }
+        for (int i = 0; i < 20; ++i) {
+            for (int j = 0; j < 20; ++j) {
+                h20[i*20 + j] = mach1_hadr_rows20[i][j] == '+' ? 1 : -1;
+            }
+        }
+    });
+    return r == 12 ? h12 : h20;
+}
+
+static void mach1_hadamard_r_f32(float * v, const int64_t d, const bool transpose) {
+    if ((d & (d - 1)) == 0) {
+        mach1_fwht_f32(v, d);
+        return;
+    }
+    const int r = d % 12 == 0 && (((d/12) & (d/12 - 1)) == 0) ? 12 : 20;
+    const int64_t M = d / r;
+    GGML_ASSERT(M*r == d && (M & (M - 1)) == 0);
+    if (M > 1) {
+        for (int a = 0; a < r; ++a) {
+            mach1_fwht_bfly_f32(v + a*M, M);
+        }
+    }
+    const int8_t * H = mach1_hadr_matrix(r);
+    const int64_t si = transpose ? 1 : r;
+    const int64_t sj = transpose ? r : 1;
+    const float   s  = sqrtf((float) d);
+    float col[20], out[20];
+    for (int64_t b = 0; b < M; ++b) {
+        for (int a = 0; a < r; ++a) {
+            col[a] = v[a*M + b];
+        }
+        for (int a = 0; a < r; ++a) {
+            float acc = 0.0f;
+            for (int c = 0; c < r; ++c) {
+                acc += (float) H[a*si + c*sj]*col[c];
+            }
+            out[a] = acc / s;
+        }
+        for (int a = 0; a < r; ++a) {
+            v[a*M + b] = out[a];
+        }
+    }
+}
+
 // ggml_compute_forward_mach1_rt_mm
 // Rotated int-lattice trellis dense matmul (payload v3 NE spine):
 //   W = diag(sv) . H_m/sqrt(m) . fp16(hatWr) . H_n/sqrt(n) . diag(su)
@@ -13004,7 +13071,7 @@ void ggml_compute_forward_mach1_rt_mm(const struct ggml_compute_params * params,
         for (int64_t j = 0; j < n; ++j) {
             u[j] = sud[j]*xr[j];
         }
-        mach1_fwht_f32(u, n);
+        mach1_hadamard_r_f32(u, n, true);
     }
     ggml_barrier(params->threadpool);
 
@@ -13173,7 +13240,7 @@ void ggml_compute_forward_mach1_rt_mm(const struct ggml_compute_params * params,
     // phase 3: y = sv .* H_m(v)/sqrt(m), one token per thread turn
     for (int64_t t = ith; t < nt; t += nth) {
         float * v = vbuf + t*m;
-        mach1_fwht_f32(v, m);
+        mach1_hadamard_r_f32(v, m, false);
         float * y = yd + t*m;
         for (int64_t i = 0; i < m; ++i) {
             y[i] = v[i]*svd[i];
@@ -13205,11 +13272,68 @@ void ggml_compute_forward_mach1_head_mm(const struct ggml_compute_params * param
     const float       * xd = (const float       *) x->data;
     float             * yd = (float             *) dst->data;
 
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256i sh_lo = _mm256_setr_epi64x(0, 5, 10, 15);
+    const __m256i sh_hi = _mm256_setr_epi64x(20, 25, 30, 35);
+    const __m256i m31   = _mm256_set1_epi64x(31);
+    const __m256i perm  = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+    const __m256i off16 = _mm256_set1_epi32(16);
+    const int64_t total_bytes = vocab*row_bytes;
+    auto codes8 = [&](const uint8_t * b) -> __m256 {
+        uint64_t word;
+        if (b + 8 <= qd + total_bytes) {
+            memcpy(&word, b, 8);
+        } else {
+            word = (uint64_t) b[0] | ((uint64_t) b[1] << 8) | ((uint64_t) b[2] << 16) |
+                   ((uint64_t) b[3] << 24) | ((uint64_t) b[4] << 32);
+        }
+        const __m256i w  = _mm256_set1_epi64x((long long) word);
+        const __m256i lo = _mm256_and_si256(_mm256_srlv_epi64(w, sh_lo), m31);
+        const __m256i hi = _mm256_and_si256(_mm256_srlv_epi64(w, sh_hi), m31);
+        const __m256i lo2 = _mm256_permutevar8x32_epi32(lo, perm);
+        const __m256i hi2 = _mm256_permutevar8x32_epi32(hi, perm);
+        const __m256i c   = _mm256_permute2x128_si256(lo2, hi2, 0x20);
+        return _mm256_cvtepi32_ps(_mm256_sub_epi32(c, off16));
+    };
+    if (nt == 1) {
+        for (int64_t r = params->ith; r < vocab; r += params->nth) {
+            const uint8_t     * pb   = qd + r*row_bytes;
+            const ggml_fp16_t * grow = gs + r*ng;
+            __m256 tot = _mm256_setzero_ps();
+            for (int64_t g = 0; g < ng; ++g) {
+                const uint8_t * gb = pb + g*40;
+                const float   * xg = xd + g*64;
+                __m256 a0 = _mm256_mul_ps(codes8(gb +  0), _mm256_loadu_ps(xg +  0));
+                __m256 a1 = _mm256_mul_ps(codes8(gb +  5), _mm256_loadu_ps(xg +  8));
+                a0 = _mm256_fmadd_ps(codes8(gb + 10), _mm256_loadu_ps(xg + 16), a0);
+                a1 = _mm256_fmadd_ps(codes8(gb + 15), _mm256_loadu_ps(xg + 24), a1);
+                a0 = _mm256_fmadd_ps(codes8(gb + 20), _mm256_loadu_ps(xg + 32), a0);
+                a1 = _mm256_fmadd_ps(codes8(gb + 25), _mm256_loadu_ps(xg + 40), a1);
+                a0 = _mm256_fmadd_ps(codes8(gb + 30), _mm256_loadu_ps(xg + 48), a0);
+                a1 = _mm256_fmadd_ps(codes8(gb + 35), _mm256_loadu_ps(xg + 56), a1);
+                tot = _mm256_fmadd_ps(_mm256_add_ps(a0, a1), _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(grow[g])), tot);
+            }
+            __m128 h = _mm_add_ps(_mm256_castps256_ps128(tot), _mm256_extractf128_ps(tot, 1));
+            h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+            h = _mm_add_ss(h, _mm_movehdup_ps(h));
+            yd[r] = _mm_cvtss_f32(h);
+        }
+        return;
+    }
+#endif
+
     for (int64_t r = params->ith; r < vocab; r += params->nth) {
         const uint8_t     * pb   = qd + r*row_bytes;
         const ggml_fp16_t * grow = gs + r*ng;
         float wrow[8192];
 
+#if defined(__AVX2__) && defined(__FMA__)
+        for (int64_t blk = 0; blk < n/8; ++blk) {
+            _mm256_storeu_ps(wrow + blk*8, _mm256_mul_ps(codes8(pb + blk*5),
+                             _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(grow[blk >> 3]))));
+        }
+        if (0)
+#endif
         for (int64_t blk = 0; blk < n/8; ++blk) {
             const uint8_t * b = pb + blk*5;
             const uint64_t word = (uint64_t) b[0] | ((uint64_t) b[1] << 8) |
@@ -13224,7 +13348,7 @@ void ggml_compute_forward_mach1_head_mm(const struct ggml_compute_params * param
         }
         for (int64_t t = 0; t < nt; ++t) {
             float sum = 0.0f;
-            ggml_vec_dot_f32((int) n, &sum, 0, wrow, 0, (float *)(xd + t*n), 0, 1);
+            ggml_vec_dot_f32((int) n, &sum, 0, wrow, 0, (const float *)(xd + t*n), 0, 1);
             yd[t*vocab + r] = sum;
         }
     }
@@ -13259,6 +13383,1001 @@ void ggml_compute_forward_mach1_embed_gather(const struct ggml_compute_params * 
             float w;
             memcpy(&w, &bits, sizeof(w));
             out[j] = w;
+        }
+    }
+}
+
+static const int8_t mach1_h12[12][12] = {
+    {  1, -1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1 },
+    { -1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1 },
+    {  1,  1,  1, -1,  1,  1, -1, -1, -1, -1,  1,  1 },
+    {  1, -1, -1, -1,  1, -1, -1,  1, -1,  1,  1, -1 },
+    {  1,  1,  1,  1,  1, -1,  1,  1, -1, -1, -1, -1 },
+    {  1, -1,  1, -1, -1, -1,  1, -1, -1,  1, -1,  1 },
+    {  1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1 },
+    {  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1 },
+    {  1,  1, -1, -1, -1, -1,  1,  1,  1, -1,  1,  1 },
+    {  1, -1, -1,  1, -1,  1,  1, -1, -1, -1,  1, -1 },
+    {  1,  1,  1,  1, -1, -1, -1, -1,  1,  1,  1, -1 },
+    {  1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1, -1 },
+};
+
+static const int8_t mach1_h20[20][20] = {
+    {  1, -1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1 },
+    { -1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1 },
+    {  1,  1,  1, -1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1 },
+    {  1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1 },
+    {  1,  1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1 },
+    {  1, -1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1 },
+    {  1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1 },
+    {  1, -1,  1, -1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1 },
+    {  1,  1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1 },
+    {  1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1 },
+    {  1,  1, -1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1 },
+    {  1, -1, -1,  1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1,  1 },
+    {  1,  1, -1, -1, -1, -1,  1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1 },
+    {  1, -1, -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1 },
+    {  1,  1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1 },
+    {  1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1,  1, -1 },
+    {  1,  1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1 },
+    {  1, -1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1 },
+    {  1,  1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1,  1,  1,  1,  1,  1,  1,  1, -1 },
+    {  1, -1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1 },
+};
+
+static void mach1_fwht_da_f32(float * v, const int64_t d) {
+    if ((d & (d - 1)) == 0) {
+        mach1_fwht_f32(v, d);
+        return;
+    }
+    const int radix = (d % 12 == 0 && ((d/12) & (d/12 - 1)) == 0) ? 12 : 20;
+    const int64_t M = d/radix;
+    GGML_ASSERT(d % radix == 0 && M > 0 && (M & (M - 1)) == 0);
+    for (int a = 0; a < radix; ++a) {
+        mach1_fwht_f32(v + a*M, M);
+    }
+    const int8_t * Hr = radix == 12 ? &mach1_h12[0][0] : &mach1_h20[0][0];
+    const float    rs = sqrtf((float) radix);
+    for (int64_t b = 0; b < M; ++b) {
+        float t[20];
+        for (int a = 0; a < radix; ++a) {
+            const int8_t * hrow = Hr + a*radix;
+            float acc = 0.0f;
+            for (int c = 0; c < radix; ++c) {
+                acc += (float) hrow[c] * v[c*M + b];
+            }
+            t[a] = acc / rs;
+        }
+        for (int a = 0; a < radix; ++a) {
+            v[a*M + b] = t[a];
+        }
+    }
+}
+
+static inline uint32_t mach1_da_row(const uint32_t p, const int mode) {
+    return (mode ? p >> 1 : p) & 0x7FFFu;
+}
+static inline uint32_t mach1_da_negbit(const uint32_t p, const int mode) {
+    return (p >> (mode ? 16 : 15)) & 1u;
+}
+
+static void mach1_da_decode_block(
+        const struct ggml_compute_params * params,
+        const uint16_t    * tr,
+        const int64_t       words,
+        const float       * tlut32,
+        const ggml_fp16_t * sue,
+        const ggml_fp16_t * sve,
+        const ggml_fp16_t * gme,
+        const int           mode,
+        const int64_t       mb,
+        const int64_t       nb,
+        float * wbuf, float * su32, float * sv32, float * colbuf) {
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t tiles_y = nb/16;
+    const int64_t ntiles  = (mb/16)*tiles_y;
+    const int     step    = (int)(words/2);
+    const int64_t Mb      = mb/16;
+    const int64_t Nb      = tiles_y;
+
+    if (ith == 0) {
+        for (int64_t j = 0; j < nb; ++j) {
+            su32[j] = GGML_CPU_FP16_TO_FP32(sue[j]);
+        }
+        for (int64_t i = 0; i < mb; ++i) {
+            sv32[i] = GGML_CPU_FP16_TO_FP32(sve[i]);
+        }
+    }
+    for (int64_t tid = ith; tid < ntiles; tid += nth) {
+        const uint16_t * tw = tr + tid*words;
+        float * wt = wbuf + (tid/tiles_y)*16*nb + (tid % tiles_y)*16;
+
+        const int64_t a = tid / tiles_y, b = tid % tiles_y;
+        const int64_t wv = (a + b <= Nb - 1) ? Mb + Nb - 1 - (a + b)
+                                             : Mb + Nb - 2 - (a + b);
+        const float gsc = GGML_CPU_FP16_TO_FP32(gme[wv]);
+
+        for (int i = 0; i < 32; ++i) {
+            const uint32_t p   = mach1_walk_state(tw, words, step*i);
+            const uint32_t row = mach1_da_row(p, mode);
+            const uint32_t ng  = mach1_da_negbit(p, mode);
+            const int ri = (8*i) >> 4;
+            const int ci = (8*i) & 15;
+            float * wo = wt + ri*nb + ci;
+            const float * ws = tlut32 + 8*row;
+            for (int c = 0; c < 8; ++c) {
+                float w = c == 0 && ng ? -ws[c] : ws[c];
+                w *= gsc;
+                wo[c] = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(w));
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    for (int64_t i = ith; i < mb; i += nth) {
+        float * row = wbuf + i*nb;
+        mach1_fwht_da_f32(row, nb);
+        for (int64_t j = 0; j < nb; ++j) {
+            row[j] *= su32[j];
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    float * col = colbuf + (size_t) ith*mb;
+    for (int64_t j = ith; j < nb; j += nth) {
+        for (int64_t i = 0; i < mb; ++i) {
+            col[i] = wbuf[i*nb + j];
+        }
+        mach1_fwht_da_f32(col, mb);
+        for (int64_t i = 0; i < mb; ++i) {
+            wbuf[i*nb + j] = col[i]*sv32[i];
+        }
+    }
+    ggml_barrier(params->threadpool);
+}
+
+void ggml_compute_forward_mach1_da_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * trellis  = dst->src[0];
+    const struct ggml_tensor * su       = dst->src[1];
+    const struct ggml_tensor * sv       = dst->src[2];
+    const struct ggml_tensor * wgamma   = dst->src[3];
+    const struct ggml_tensor * tlut     = dst->src[4];
+    const struct ggml_tensor * x        = dst->src[5];
+    const struct ggml_tensor * exc_idx  = dst->src[6];
+    const struct ggml_tensor * exc_rows = dst->src[7];
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int mode  = ggml_get_op_params_i32(dst, 0);
+    const int split = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t nb    = su->ne[0];
+    const int64_t mb    = sv->ne[0];
+    const int64_t E     = trellis->ne[2];
+    const int64_t words = trellis->ne[0];
+    const int64_t tiles = trellis->ne[1];
+    const int64_t gl    = wgamma->ne[0];
+    const int64_t n     = x->ne[0];
+    const int64_t m     = dst->ne[0];
+    const int64_t nt    = x->ne[1]*x->ne[2]*x->ne[3];
+
+    const ggml_fp16_t * sud = (const ggml_fp16_t *) su->data;
+    const ggml_fp16_t * svd = (const ggml_fp16_t *) sv->data;
+    const ggml_fp16_t * gmd = (const ggml_fp16_t *) wgamma->data;
+    const float       * tld = (const float       *) tlut->data;
+    const float       * xd  = (const float       *) x->data;
+    float             * yd  = (float             *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    char * w = (char *) params->wdata;
+    float * wbuf   = (float *) w; w += sizeof(float)*mb*nb;
+    float * su32   = (float *) w; w += sizeof(float)*nb;
+    float * sv32   = (float *) w; w += sizeof(float)*mb;
+    float * colbuf = (float *) w; w += sizeof(float)*(size_t) nth*mb;
+    GGML_ASSERT((size_t)(w - (char *) params->wdata) <= params->wsize);
+
+    for (int64_t e = 0; e < E; ++e) {
+        mach1_da_decode_block(params, (const uint16_t *) trellis->data + e*tiles*words, words,
+                              tld, sud + e*nb, svd + e*mb, gmd + e*gl, mode, mb, nb,
+                              wbuf, su32, sv32, colbuf);
+
+        for (int64_t i = ith; i < mb; i += nth) {
+            const float * wrow = wbuf + i*nb;
+            for (int64_t t = 0; t < nt; ++t) {
+                const float * xc = xd + t*n + (split == 1 ? e*nb : 0);
+                float sum = 0.0f;
+                ggml_vec_dot_f32((int) nb, &sum, 0, (const float *) wrow, 0, (const float *) xc, 0, 1);
+                if (split == 1) {
+                    yd[t*m + i] = e == 0 ? sum : yd[t*m + i] + sum;
+                } else {
+                    yd[t*m + (split == 2 ? e*mb : 0) + i] = sum;
+                }
+            }
+        }
+        ggml_barrier(params->threadpool);
+    }
+
+    if (exc_idx) {
+        const int      exc_base = ggml_get_op_params_i32(dst, 2);
+        const int64_t      n_exc = exc_idx->ne[0];
+        const int32_t    * eid   = (const int32_t    *) exc_idx->data;
+        const ggml_bf16_t * erd  = (const ggml_bf16_t *) exc_rows->data;
+        for (int64_t j = ith; j < n_exc; j += nth) {
+            const int64_t ri = eid[j] - exc_base;
+            GGML_ASSERT(ri >= 0 && ri < m);
+            const ggml_bf16_t * er = erd + j*n;
+            for (int64_t t = 0; t < nt; ++t) {
+                const float * xc = xd + t*n;
+                float acc = 0.0f;
+                for (int64_t i = 0; i < n; ++i) {
+                    acc += GGML_BF16_TO_FP32(er[i]) * xc[i];
+                }
+                yd[t*m + ri] = acc;
+            }
+        }
+    }
+}
+
+static inline uint32_t mach1_int_code(const uint8_t * row, const int64_t j, const int bits) {
+    const int64_t bp  = j*bits;
+    const int64_t by  = bp >> 3;
+    const int     off = (int)(bp & 7);
+    if (off + bits > 8) {
+        const uint32_t v = ((uint32_t) row[by] << 8) | row[by + 1];
+        return (v >> (16 - off - bits)) & ((1u << bits) - 1);
+    }
+    return ((uint32_t) row[by] >> (8 - off - bits)) & ((1u << bits) - 1);
+}
+
+void ggml_compute_forward_mach1_int_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * q  = dst->src[0];
+    const struct ggml_tensor * mn = dst->src[1];
+    const struct ggml_tensor * mx = dst->src[2];
+    const struct ggml_tensor * x  = dst->src[3];
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int bits = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t n   = x->ne[0];
+    const int64_t m   = q->ne[1];
+    const int64_t ngr = mn->ne[0];
+    const int64_t g   = n/ngr;
+    const int64_t nt  = x->ne[1]*x->ne[2]*x->ne[3];
+    const int64_t rowb = n*bits/8;
+
+    GGML_ASSERT(ngr <= 512);
+
+    const uint8_t     * qd  = (const uint8_t     *) q->data;
+    const ggml_fp16_t * mnd = (const ggml_fp16_t *) mn->data;
+    const ggml_fp16_t * mxd = (const ggml_fp16_t *) mx->data;
+    const float       * xd  = (const float       *) x->data;
+    float             * yd  = (float             *) dst->data;
+
+    float * wrow = (float *) params->wdata + (size_t) params->ith*n;
+    GGML_ASSERT(sizeof(float)*(size_t) params->nth*n <= params->wsize);
+
+    const float denom = (float)((1 << bits) - 1);
+
+    for (int64_t r = params->ith; r < m; r += params->nth) {
+        float mnf[512];
+        float sc[512];
+        for (int64_t gi = 0; gi < ngr; ++gi) {
+            mnf[gi] = GGML_CPU_FP16_TO_FP32(mnd[r*ngr + gi]);
+            const float d  = GGML_CPU_FP16_TO_FP32(mxd[r*ngr + gi]) - mnf[gi];
+            const float dm = fmaxf(d, 1e-8f);
+            sc[gi] = dm/denom;
+        }
+        const uint8_t * qrow = qd + r*rowb;
+        for (int64_t j = 0; j < n; ++j) {
+            const float qv = (float) mach1_int_code(qrow, j, bits);
+            const float pr = qv*sc[j/g];
+            wrow[j] = mnf[j/g] + pr;
+        }
+        for (int64_t t = 0; t < nt; ++t) {
+            float sum = 0.0f;
+            ggml_vec_dot_f32((int) n, &sum, 0, wrow, 0, (const float *)(xd + t*n), 0, 1);
+            yd[t*m + r] = sum;
+        }
+    }
+}
+
+void ggml_compute_forward_mach1_da_embed(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * trellis = dst->src[0];
+    const struct ggml_tensor * su      = dst->src[1];
+    const struct ggml_tensor * sv      = dst->src[2];
+    const struct ggml_tensor * wgamma  = dst->src[3];
+    const struct ggml_tensor * tlut    = dst->src[4];
+    const struct ggml_tensor * ids     = dst->src[5];
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int mode = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t nb    = su->ne[0];
+    const int64_t mb    = sv->ne[0];
+    const int64_t E     = trellis->ne[2];
+    const int64_t words = trellis->ne[0];
+    const int64_t tiles = trellis->ne[1];
+    const int64_t gl    = wgamma->ne[0];
+    const int64_t nt    = ids->ne[0];
+
+    const ggml_fp16_t * sud = (const ggml_fp16_t *) su->data;
+    const ggml_fp16_t * svd = (const ggml_fp16_t *) sv->data;
+    const ggml_fp16_t * gmd = (const ggml_fp16_t *) wgamma->data;
+    const float       * tld = (const float       *) tlut->data;
+    const int32_t     * id  = (const int32_t     *) ids->data;
+    float             * yd  = (float             *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    char * w = (char *) params->wdata;
+    float * wbuf   = (float *) w; w += sizeof(float)*mb*nb;
+    float * su32   = (float *) w; w += sizeof(float)*nb;
+    float * sv32   = (float *) w; w += sizeof(float)*mb;
+    float * colbuf = (float *) w; w += sizeof(float)*(size_t) nth*mb;
+    GGML_ASSERT((size_t)(w - (char *) params->wdata) <= params->wsize);
+
+    for (int64_t e = 0; e < E; ++e) {
+        bool used = false;
+        for (int64_t t = 0; t < nt && !used; ++t) {
+            GGML_ASSERT(id[t] >= 0 && id[t] < E*mb);
+            used = id[t]/mb == e;
+        }
+        if (!used) {
+            continue;
+        }
+        mach1_da_decode_block(params, (const uint16_t *) trellis->data + e*tiles*words, words,
+                              tld, sud + e*nb, svd + e*mb, gmd + e*gl, mode, mb, nb,
+                              wbuf, su32, sv32, colbuf);
+        for (int64_t t = ith; t < nt; t += nth) {
+            if (id[t]/mb == e) {
+                memcpy(yd + t*nb, wbuf + (id[t] - e*mb)*nb, sizeof(float)*nb);
+            }
+        }
+        ggml_barrier(params->threadpool);
+    }
+}
+
+static const int8_t * mach1_paley(int r) {
+    static int8_t h12[12*12], h20[20*20];
+    static std::once_flag once;
+    std::call_once(once, [] {
+        auto build = [](int q, int8_t * H, auto chi, auto sub) {
+            const int n = q + 1, r = 2*n;
+            std::vector<int> C(n*n, 0);
+            for (int j = 1; j < n; ++j) {
+                C[j] = 1;
+                C[j*n] = 1;
+            }
+            for (int i = 1; i < n; ++i) {
+                for (int j = 1; j < n; ++j) {
+                    C[i*n + j] = chi(sub(i - 1, j - 1));
+                }
+            }
+            const int A[2][2] = { { 1, 1 }, { 1, -1 } };
+            const int B[2][2] = { { 1, -1 }, { -1, -1 } };
+            for (int i = 0; i < n; ++i) {
+                for (int a = 0; a < 2; ++a) {
+                    for (int j = 0; j < n; ++j) {
+                        for (int b = 0; b < 2; ++b) {
+                            H[(2*i + a)*r + 2*j + b] = (int8_t)(C[i*n + j]*A[a][b] + (i == j ? B[a][b] : 0));
+                        }
+                    }
+                }
+            }
+        };
+        build(5, h12, [](int e) { const int c[5] = { 0, 1, -1, -1, 1 }; return c[e]; },
+              [](int u, int v) { return ((u - v) % 5 + 5) % 5; });
+        auto mul = [](int u, int v) {
+            const int a = u/3, b = u%3, c = v/3, d = v%3;
+            return (((a*c - b*d) % 3 + 3) % 3)*3 + ((a*d + b*c) % 3 + 3) % 3;
+        };
+        bool sq[9] = { false };
+        for (int e = 1; e < 9; ++e) {
+            sq[mul(e, e)] = true;
+        }
+        build(9, h20, [sq](int e) { return e == 0 ? 0 : (sq[e] ? 1 : -1); },
+              [](int u, int v) { return ((u/3 - v/3 + 3) % 3)*3 + (u%3 - v%3 + 3) % 3; });
+    });
+    return r == 12 ? h12 : h20;
+}
+
+static void mach1_hadamard_f32(float * v, const int64_t d) {
+    if ((d & (d - 1)) == 0) {
+        mach1_fwht_f32(v, d);
+        return;
+    }
+    const int r = d % 12 == 0 && (((d/12) & (d/12 - 1)) == 0) ? 12 : 20;
+    const int64_t M = d / r;
+    GGML_ASSERT(M*r == d && (M & (M - 1)) == 0);
+    if (M > 1) {
+        for (int a = 0; a < r; ++a) {
+            mach1_fwht_f32(v + a*M, M);
+        }
+    }
+    const int8_t * H = mach1_paley(r);
+    const float s = sqrtf((float) r);
+    float col[20], out[20];
+    for (int64_t b = 0; b < M; ++b) {
+        for (int a = 0; a < r; ++a) {
+            col[a] = v[a*M + b];
+        }
+        for (int a = 0; a < r; ++a) {
+            float acc = 0.0f;
+            for (int c = 0; c < r; ++c) {
+                acc += (float) H[a*r + c]*col[c];
+            }
+            out[a] = acc / s;
+        }
+        for (int a = 0; a < r; ++a) {
+            v[a*M + b] = out[a];
+        }
+    }
+}
+
+struct mach1_d4_tab {
+    std::vector<uint32_t> z8;
+    uint64_t sig = 0;
+};
+
+static uint64_t mach1_d4_sig(const uint16_t * zt) {
+    uint64_t h = 1469598103934665603ull;
+    for (int64_t i = 0; i < 5*65536; i += 4099) {
+        h = (h ^ zt[i])*1099511628211ull;
+    }
+    return h;
+}
+
+static const uint32_t * mach1_d4_get_tab(const uint16_t * zt) {
+    static std::mutex mtx;
+    static std::unordered_map<const void *, mach1_d4_tab> cache;
+    std::lock_guard<std::mutex> lock(mtx);
+    const uint64_t sig = mach1_d4_sig(zt);
+    auto it = cache.find(zt);
+    if (it != cache.end() && it->second.sig == sig) {
+        return it->second.z8.data();
+    }
+    mach1_d4_tab & T = cache[zt];
+    T.z8.resize(5*65536);
+    for (int64_t i = 0; i < 5*65536; ++i) {
+        uint32_t w = 0;
+        for (int c = 0; c < 4; ++c) {
+            const int8_t z = (int8_t)((zt[i] >> (4*c)) & 15) - 8;
+            w |= (uint32_t)(uint8_t) z << (8*c);
+        }
+        T.z8[i] = w;
+    }
+    T.sig = sig;
+    return T.z8.data();
+}
+
+static inline void mach1_d4_tile_z(const uint16_t * tw, int K4, const uint32_t * z8, uint32_t * z) {
+    uint8_t buf[8*8 + 3];
+    const int nbytes = 8*K4;
+    for (int i = 0; i < 4*K4; ++i) {
+        buf[2*i + 0] = (uint8_t)(tw[i] >> 8);
+        buf[2*i + 1] = (uint8_t)(tw[i] & 0xFF);
+    }
+    buf[nbytes + 0] = buf[0];
+    buf[nbytes + 1] = buf[1];
+    buf[nbytes + 2] = buf[2];
+    for (int j = 0; j < 64; ++j) {
+        const int b  = j*K4;
+        const int by = b >> 3;
+        const uint32_t w24 = ((uint32_t) buf[by] << 16) | ((uint32_t) buf[by + 1] << 8) | buf[by + 2];
+        z[j] = z8[(w24 >> (8 - (b & 7))) & 0xFFFFu];
+    }
+}
+
+#if defined(__AVX2__)
+struct mach1_d4_win {
+    __m256i shuf;
+    __m256i shift;
+};
+
+static const mach1_d4_win * mach1_d4_wins() {
+    static mach1_d4_win w[5];
+    static std::once_flag once;
+    std::call_once(once, [] {
+        for (int K4 = 4; K4 <= 8; ++K4) {
+            alignas(32) int8_t  sb[32];
+            alignas(32) int32_t sv[8];
+            for (int i = 0; i < 8; ++i) {
+                const int bit = i*K4;
+                const int by  = bit >> 3;
+                for (int q = 0; q < 4; ++q) {
+                    sb[4*i + q] = (int8_t)(by + 3 - q);
+                }
+                sv[i] = 16 - (bit & 7);
+            }
+            w[K4 - 4].shuf  = _mm256_load_si256((const __m256i *) sb);
+            w[K4 - 4].shift = _mm256_load_si256((const __m256i *) sv);
+        }
+    });
+    return w;
+}
+
+static inline void mach1_d4_tile_z_avx2(const uint16_t * tw, int K4, const uint32_t * z8, uint32_t mult,
+                                        __m256i lvl, uint32_t * z) {
+    alignas(32) uint8_t  buf[64 + 32];
+    alignas(32) uint16_t tmp[32];
+    const int nw = 4*K4;
+    memcpy(tmp, tw, sizeof(uint16_t)*nw);
+    const __m256i bswap16 = _mm256_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
+                                             1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    _mm256_store_si256((__m256i *) buf,        _mm256_shuffle_epi8(_mm256_load_si256((const __m256i *) tmp),        bswap16));
+    _mm256_store_si256((__m256i *) (buf + 32), _mm256_shuffle_epi8(_mm256_load_si256((const __m256i *) (tmp + 16)), bswap16));
+    memcpy(buf + 2*nw, buf, 16);
+
+    const mach1_d4_win & W = mach1_d4_wins()[K4 - 4];
+    const __m256i m16   = _mm256_set1_epi32(0xFFFF);
+    const __m256i multv = _mm256_set1_epi32((int) mult);
+    const __m256i m0f0f = _mm256_set1_epi32(0x0F0F);
+    const __m256i m0f   = _mm256_set1_epi32(0x000F);
+    const __m256i mf00  = _mm256_set1_epi32(0x0F00);
+    for (int g = 0; g < 8; ++g) {
+        const __m256i src = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (buf + g*K4)));
+        const __m256i w   = _mm256_shuffle_epi8(src, W.shuf);
+        const __m256i st  = _mm256_and_si256(_mm256_srlv_epi32(w, W.shift), m16);
+        if (mult != 0) {
+            const __m256i h  = _mm256_srli_epi32(_mm256_mullo_epi32(st, multv), 16);
+            const __m256i a  = _mm256_and_si256(h, m0f0f);
+            const __m256i b  = _mm256_and_si256(_mm256_srli_epi32(h, 4), m0f0f);
+            const __m256i ix = _mm256_or_si256(
+                _mm256_or_si256(_mm256_and_si256(a, m0f), _mm256_slli_epi32(_mm256_and_si256(a, mf00), 8)),
+                _mm256_or_si256(_mm256_slli_epi32(_mm256_and_si256(b, m0f), 8), _mm256_slli_epi32(_mm256_and_si256(b, mf00), 16)));
+            _mm256_storeu_si256((__m256i *) (z + 8*g), _mm256_shuffle_epi8(lvl, ix));
+        } else {
+            alignas(32) uint32_t sts[8];
+            _mm256_store_si256((__m256i *) sts, st);
+            for (int i = 0; i < 8; ++i) {
+                z[8*g + i] = z8[sts[i]];
+            }
+        }
+    }
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+struct mach1_d4_win512 {
+    __m512i ia[2];
+    __m512i ib[2];
+    __m512i sl[2];
+    __m512i sr[2];
+};
+
+static const mach1_d4_win512 * mach1_d4_wins512() {
+    static mach1_d4_win512 w[5];
+    static std::once_flag once;
+    std::call_once(once, [] {
+        for (int K4 = 4; K4 <= 8; ++K4) {
+            const int nw = 4*K4;
+            for (int h = 0; h < 2; ++h) {
+                alignas(64) uint16_t ia[32], ib[32], sl[32], sr[32];
+                for (int k = 0; k < 32; ++k) {
+                    const int L = k >> 3, t = k & 7;
+                    const int j = 32*h + (t < 4 ? 4*L + t : 16 + 4*L + (t - 4));
+                    const int bit = j*K4;
+                    const int i   = bit >> 4;
+                    ia[k] = (uint16_t) (i % nw);
+                    ib[k] = (uint16_t) ((i + 1) % nw);
+                    sl[k] = (uint16_t) (bit & 15);
+                    sr[k] = (uint16_t) (16 - (bit & 15));
+                }
+                w[K4 - 4].ia[h] = _mm512_load_si512((const void *) ia);
+                w[K4 - 4].ib[h] = _mm512_load_si512((const void *) ib);
+                w[K4 - 4].sl[h] = _mm512_load_si512((const void *) sl);
+                w[K4 - 4].sr[h] = _mm512_load_si512((const void *) sr);
+            }
+        }
+    });
+    return w;
+}
+
+#define MACH1_D4_P0213 _mm512_set_epi8(15, 13, 14, 12, 11, 9, 10, 8, 7, 5, 6, 4, 3, 1, 2, 0, \
+                                       15, 13, 14, 12, 11, 9, 10, 8, 7, 5, 6, 4, 3, 1, 2, 0, \
+                                       15, 13, 14, 12, 11, 9, 10, 8, 7, 5, 6, 4, 3, 1, 2, 0, \
+                                       15, 13, 14, 12, 11, 9, 10, 8, 7, 5, 6, 4, 3, 1, 2, 0)
+
+static inline void mach1_d4_tile_Z512(const uint16_t * tw, int K4, uint32_t mult, __m512i lvlu, __m512i * Z) {
+    const mach1_d4_win512 & W = mach1_d4_wins512()[K4 - 4];
+    const __m512i words = _mm512_maskz_loadu_epi16((__mmask32) (0xFFFFFFFFu >> (32 - 4*K4)), tw);
+    const __m512i mlo   = _mm512_set1_epi16((short) (mult & 0xFFFFu));
+    const __m512i mhi   = _mm512_set1_epi16((short) (mult >> 16));
+    const __m512i n0f   = _mm512_set1_epi16(0x0F0F);
+    for (int h = 0; h < 2; ++h) {
+        const __m512i st = _mm512_or_si512(
+            _mm512_sllv_epi16(_mm512_permutexvar_epi16(W.ia[h], words), W.sl[h]),
+            _mm512_srlv_epi16(_mm512_permutexvar_epi16(W.ib[h], words), W.sr[h]));
+        const __m512i hh = _mm512_add_epi16(_mm512_mulhi_epu16(st, mlo), _mm512_mullo_epi16(st, mhi));
+        const __m512i A  = _mm512_shuffle_epi8(lvlu, _mm512_and_si512(hh, n0f));
+        const __m512i B  = _mm512_shuffle_epi8(lvlu, _mm512_and_si512(_mm512_srli_epi16(hh, 4), n0f));
+        Z[2*h + 0] = _mm512_unpacklo_epi16(A, B);
+        Z[2*h + 1] = _mm512_unpackhi_epi16(A, B);
+    }
+}
+#endif
+#endif
+
+static bool mach1_d4_exact() {
+    static const bool v = []() {
+        const char * e = getenv("GGML_MACH1_D4_EXACT");
+        return e && atoi(e) != 0;
+    }();
+    return v;
+}
+
+#if defined(__AVX2__)
+static inline __m256i mach1_dpbusd256(__m256i acc, __m256i a, __m256i b) {
+#if defined(__AVXVNNI__)
+    return _mm256_dpbusd_avx_epi32(acc, a, b);
+#elif defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    return _mm256_dpbusd_epi32(acc, a, b);
+#else
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(a, b), _mm256_set1_epi16(1)));
+#endif
+}
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static inline __m512i mach1_dpbusd512(__m512i acc, __m512i a, __m512i b) {
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbusd_epi32(acc, a, b);
+#else
+    return _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(a, b), _mm512_set1_epi16(1)));
+#endif
+}
+#endif
+
+void ggml_compute_forward_mach1_d4_mm(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * trellis = dst->src[0];
+    const struct ggml_tensor * offs    = dst->src[1];
+    const struct ggml_tensor * su      = dst->src[2];
+    const struct ggml_tensor * sv      = dst->src[3];
+    const struct ggml_tensor * gw      = dst->src[4];
+    const struct ggml_tensor * zt      = dst->src[5];
+    const struct ggml_tensor * units   = dst->src[6];
+    const struct ggml_tensor * ids     = dst->src[7];
+    const struct ggml_tensor * x       = dst->src[8];
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n        = su->ne[0];
+    const int64_t m        = sv->ne[0];
+    const int64_t Mb       = m/16;
+    const int64_t Nb       = n/16;
+    const int64_t n_expert = offs->ne[1];
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_tok    = ids->ne[1];
+    const int64_t n_pairs  = n_used*n_tok;
+    const int64_t xne1     = x->ne[1];
+
+    const uint16_t    * trd = (const uint16_t    *) trellis->data;
+    const int32_t     * ofd = (const int32_t     *) offs->data;
+    const ggml_fp16_t * sud = (const ggml_fp16_t *) su->data;
+    const ggml_fp16_t * svd = (const ggml_fp16_t *) sv->data;
+    const float       * gwd = (const float       *) gw->data;
+    const uint16_t    * ztd = (const uint16_t    *) zt->data;
+    const float       * und = (const float       *) units->data;
+    const float       * xd  = (const float       *) x->data;
+    float             * yd  = (float             *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    char * w = (char *) params->wdata;
+    float   * ubuf    = (float   *) w; w += sizeof(float)*(size_t) n_pairs*n;
+    float   * vbuf    = (float   *) w; w += sizeof(float)*(size_t) n_pairs*m;
+    int32_t * grp_cnt = (int32_t *) w; w += sizeof(int32_t)*n_expert;
+    int32_t * grp_off = (int32_t *) w; w += sizeof(int32_t)*n_expert;
+    int32_t * active  = (int32_t *) w; w += sizeof(int32_t)*(n_expert + 1);
+    int32_t * pairs   = (int32_t *) w; w += sizeof(int32_t)*3*n_pairs;
+    float   * udbuf   = (float   *) w; w += sizeof(float)*(size_t) n_pairs*(n/16);
+    int8_t  * uqbuf   = (int8_t  *) w; w += (size_t) n_pairs*n;
+    GGML_ASSERT((size_t)(w - (char *) params->wdata) <= params->wsize);
+#if defined(__AVX2__)
+    const bool q8 = !mach1_d4_exact();
+#else
+    const bool q8 = false;
+#endif
+
+    auto id_at = [&](int64_t s, int64_t t) {
+        return *(const int32_t *)((const char *) ids->data + s*ids->nb[0] + t*ids->nb[1]);
+    };
+
+    if (ith == 0) {
+        memset(grp_cnt, 0, sizeof(int32_t)*n_expert);
+        for (int64_t t = 0; t < n_tok; ++t) {
+            for (int64_t s = 0; s < n_used; ++s) {
+                const int32_t e = id_at(s, t);
+                GGML_ASSERT(e >= 0 && e < n_expert);
+                grp_cnt[e]++;
+            }
+        }
+        int32_t off = 0, na = 0;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            grp_off[e] = off;
+            off += grp_cnt[e];
+            if (grp_cnt[e] > 0) {
+                active[1 + na++] = (int32_t) e;
+            }
+            grp_cnt[e] = 0;
+        }
+        active[0] = na;
+        for (int64_t t = 0; t < n_tok; ++t) {
+            for (int64_t s = 0; s < n_used; ++s) {
+                const int32_t e = id_at(s, t);
+                const int64_t p = grp_off[e] + grp_cnt[e]++;
+                pairs[3*p + 0] = (int32_t) s;
+                pairs[3*p + 1] = (int32_t) t;
+                pairs[3*p + 2] = e;
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    for (int64_t p = ith; p < n_pairs; p += nth) {
+        const int64_t sI = pairs[3*p + 0];
+        const int64_t tI = pairs[3*p + 1];
+        const int64_t e  = pairs[3*p + 2];
+        const float * xc = xd + (xne1 == 1 ? 0 : sI*n) + tI*xne1*n;
+        float * u = ubuf + p*n;
+        for (int64_t j = 0; j < n; ++j) {
+            u[j] = GGML_CPU_FP16_TO_FP32(sud[e*n + j])*xc[j];
+        }
+        mach1_hadamard_f32(u, n);
+        if (q8) {
+            int8_t * uq = uqbuf + p*n;
+            float  * ud = udbuf + p*(n/16);
+            for (int64_t b = 0; b < n/16; ++b) {
+                float amax = 0.0f;
+                for (int c = 0; c < 16; ++c) {
+                    amax = std::max(amax, fabsf(u[b*16 + c]));
+                }
+                const float d  = amax/127.0f;
+                const float id = d > 0.0f ? 1.0f/d : 0.0f;
+                for (int c = 0; c < 16; ++c) {
+                    uq[b*16 + c] = (int8_t) lrintf(u[b*16 + c]*id);
+                }
+                ud[b] = d;
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    const uint32_t * z8all = mach1_d4_get_tab(ztd);
+    const bool hashed = ggml_get_op_params_i32(dst, 15) == 1;
+    GGML_UNUSED(hashed);
+    const int64_t n_jobs = (int64_t) active[0]*Mb;
+    static thread_local std::vector<float> accs;
+    for (int64_t job = ith; job < n_jobs; job += nth) {
+        const int64_t e   = active[1 + job / Mb];
+        const int64_t a   = job % Mb;
+        const int64_t cnt = grp_cnt[e];
+        const int64_t p0  = grp_off[e];
+        const int     K4  = ofd[2*e + 1];
+        GGML_ASSERT(K4 >= 4 && K4 <= 8);
+        const uint16_t * tr  = trd + (size_t) ofd[2*e + 0];
+        const uint32_t * z8  = z8all + (size_t)(K4 - 4)*65536;
+        const float      un  = und[K4 - 4];
+        const float    * gwe = gwd + e*(Mb + Nb);
+        const int64_t   words = 4*K4;
+
+        if ((int64_t) accs.size() < cnt*256) {
+            accs.resize(cnt*256);
+        }
+        float * acc = accs.data();
+        memset(acc, 0, sizeof(float)*cnt*256);
+
+#if defined(__AVX2__)
+        const uint32_t mult = hashed ? (uint32_t) ggml_get_op_params_i32(dst, 3*(K4 - 4)) : 0;
+        __m256i lvl = _mm256_setzero_si256();
+        if (mult != 0) {
+            alignas(32) int8_t lb[32];
+            const uint64_t lv = (uint64_t)(uint32_t) ggml_get_op_params_i32(dst, 3*(K4 - 4) + 1) |
+                               ((uint64_t)(uint32_t) ggml_get_op_params_i32(dst, 3*(K4 - 4) + 2) << 32);
+            for (int k = 0; k < 16; ++k) {
+                lb[k] = lb[16 + k] = (int8_t)((int)(((lv >> (4*k)) & 15) << 28) >> 28);
+            }
+            lvl = _mm256_load_si256((const __m256i *) lb);
+        }
+#endif
+        alignas(32) uint32_t zw[64];
+        alignas(64) float    zf[256];
+        float    us[16];
+#if defined(__AVX2__)
+        if (q8) {
+            const __m256i m0f = _mm256_set1_epi8(0x0F);
+            const __m256i x08 = _mm256_set1_epi8(0x08);
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            const __m512i e8 = _mm512_set1_epi8(8);
+            const bool reg = cnt == 1;
+            __m512 F1[4];
+            for (int q = 0; q < 4; ++q) {
+                F1[q] = _mm512_setzero_ps();
+            }
+            static const bool z512 = getenv("GGML_MACH1_D4_Z512") == nullptr || atoi(getenv("GGML_MACH1_D4_Z512")) != 0;
+            const __m512i lvlu = _mm512_xor_si512(_mm512_and_si512(
+                _mm512_inserti64x4(_mm512_castsi256_si512(lvl), lvl, 1), _mm512_set1_epi8(0x0F)), e8);
+            const bool zp = mult != 0 && z512;
+            const __m512i p0213 = MACH1_D4_P0213;
+            for (int64_t b = 0; b < Nb; ++b) {
+                __m512i Z[4];
+                if (zp) {
+                    mach1_d4_tile_Z512(tr + (a*Nb + b)*words, K4, mult, lvlu, Z);
+                } else {
+                    mach1_d4_tile_z_avx2(tr + (a*Nb + b)*words, K4, z8, mult, lvl, zw);
+                    for (int q = 0; q < 4; ++q) {
+                        const __m256i lo = _mm256_xor_si256(_mm256_and_si256(_mm256_load_si256((const __m256i *) zw + 2*q),     m0f), x08);
+                        const __m256i hi = _mm256_xor_si256(_mm256_and_si256(_mm256_load_si256((const __m256i *) zw + 2*q + 1), m0f), x08);
+                        Z[q] = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+                    }
+                }
+                const int64_t wv = (a + b <= Nb - 1) ? Mb + Nb - 1 - (a + b) : Mb + Nb - 2 - (a + b);
+                const float sc = un*gwe[wv];
+                for (int64_t k = 0; k < cnt; ++k) {
+                    const int64_t pp = p0 + k;
+                    __m512i ub = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(uqbuf + pp*n + b*16)));
+                    if (zp) {
+                        ub = _mm512_shuffle_epi8(ub, p0213);
+                    }
+                    const __m512i nc = _mm512_sub_epi32(_mm512_setzero_si512(), mach1_dpbusd512(_mm512_setzero_si512(), e8, ub));
+                    const __m512  sv = _mm512_set1_ps(sc*udbuf[pp*(n/16) + b]);
+                    if (reg) {
+                        for (int q = 0; q < 4; ++q) {
+                            F1[q] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(mach1_dpbusd512(nc, Z[q], ub)), sv, F1[q]);
+                        }
+                    } else {
+                        float * fk = acc + k*64;
+                        for (int q = 0; q < 4; ++q) {
+                            _mm512_storeu_ps(fk + 16*q, _mm512_fmadd_ps(_mm512_cvtepi32_ps(mach1_dpbusd512(nc, Z[q], ub)), sv,
+                                                                        _mm512_loadu_ps(fk + 16*q)));
+                        }
+                    }
+                }
+            }
+            if (reg) {
+                for (int q = 0; q < 4; ++q) {
+                    _mm512_storeu_ps(acc + 16*q, F1[q]);
+                }
+            }
+            const int R = 4;
+#else
+            for (int64_t b = 0; b < Nb; ++b) {
+                mach1_d4_tile_z_avx2(tr + (a*Nb + b)*words, K4, z8, mult, lvl, zw);
+                __m256i Z[8];
+                for (int q = 0; q < 8; ++q) {
+                    Z[q] = _mm256_xor_si256(_mm256_and_si256(_mm256_load_si256((const __m256i *) zw + q), m0f), x08);
+                }
+                const int64_t wv = (a + b <= Nb - 1) ? Mb + Nb - 1 - (a + b) : Mb + Nb - 2 - (a + b);
+                const float sc = un*gwe[wv];
+                for (int64_t k = 0; k < cnt; ++k) {
+                    const int64_t pp = p0 + k;
+                    const __m256i ub = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(uqbuf + pp*n + b*16)));
+                    const __m256i nc = _mm256_sub_epi32(_mm256_setzero_si256(), mach1_dpbusd256(_mm256_setzero_si256(), x08, ub));
+                    const __m256  sv = _mm256_set1_ps(sc*udbuf[pp*(n/16) + b]);
+                    float * fk = acc + k*64;
+                    for (int q = 0; q < 8; ++q) {
+                        _mm256_storeu_ps(fk + 8*q, _mm256_fmadd_ps(_mm256_cvtepi32_ps(mach1_dpbusd256(nc, Z[q], ub)), sv,
+                                                                   _mm256_loadu_ps(fk + 8*q)));
+                    }
+                }
+            }
+            const int R = 2;
+#endif
+            GGML_UNUSED(R);
+            for (int64_t k = 0; k < cnt; ++k) {
+                float * v = vbuf + (p0 + k)*m + a*16;
+                const float * fk = acc + k*64;
+                for (int r = 0; r < 16; ++r) {
+                    v[r] = (fk[4*r + 0] + fk[4*r + 1]) + (fk[4*r + 2] + fk[4*r + 3]);
+                }
+            }
+            continue;
+        }
+#endif
+#if defined(__AVX2__) && defined(__FMA__)
+        if (cnt == 1) {
+            const float * u0 = ubuf + p0*n;
+            float * v = vbuf + p0*m + a*16;
+#if defined(__AVX512F__)
+            __m512 A[16];
+            for (int r = 0; r < 16; ++r) {
+                A[r] = _mm512_setzero_ps();
+            }
+            for (int64_t b = 0; b < Nb; ++b) {
+                mach1_d4_tile_z_avx2(tr + (a*Nb + b)*words, K4, z8, mult, lvl, zw);
+                const int64_t wv = (a + b <= Nb - 1) ? Mb + Nb - 1 - (a + b) : Mb + Nb - 2 - (a + b);
+                const __m512 uv = _mm512_mul_ps(_mm512_set1_ps(un*gwe[wv]), _mm512_loadu_ps(u0 + b*16));
+                const int8_t * z = (const int8_t *) zw;
+                for (int r = 0; r < 16; ++r) {
+                    const __m512 zr = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(z + 16*r))));
+                    A[r] = _mm512_fmadd_ps(zr, uv, A[r]);
+                }
+            }
+            for (int r = 0; r < 16; ++r) {
+                v[r] = _mm512_reduce_add_ps(A[r]);
+            }
+#else
+            __m256 A[16];
+            for (int r = 0; r < 16; ++r) {
+                A[r] = _mm256_setzero_ps();
+            }
+            for (int64_t b = 0; b < Nb; ++b) {
+                mach1_d4_tile_z_avx2(tr + (a*Nb + b)*words, K4, z8, mult, lvl, zw);
+                const int64_t wv = (a + b <= Nb - 1) ? Mb + Nb - 1 - (a + b) : Mb + Nb - 2 - (a + b);
+                const __m256 scv = _mm256_set1_ps(un*gwe[wv]);
+                const __m256 ul  = _mm256_mul_ps(scv, _mm256_loadu_ps(u0 + b*16));
+                const __m256 uh  = _mm256_mul_ps(scv, _mm256_loadu_ps(u0 + b*16 + 8));
+                const int8_t * z = (const int8_t *) zw;
+                for (int r = 0; r < 16; ++r) {
+                    const __m256 zl = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(z + 16*r))));
+                    const __m256 zh = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(z + 16*r + 8))));
+                    A[r] = _mm256_fmadd_ps(zh, uh, _mm256_fmadd_ps(zl, ul, A[r]));
+                }
+            }
+            for (int r = 0; r < 16; ++r) {
+                __m128 q = _mm_add_ps(_mm256_castps256_ps128(A[r]), _mm256_extractf128_ps(A[r], 1));
+                q = _mm_add_ps(q, _mm_movehl_ps(q, q));
+                q = _mm_add_ss(q, _mm_movehdup_ps(q));
+                v[r] = _mm_cvtss_f32(q);
+            }
+#endif
+            continue;
+        }
+#endif
+        for (int64_t b = 0; b < Nb; ++b) {
+#if defined(__AVX2__)
+            mach1_d4_tile_z_avx2(tr + (a*Nb + b)*words, K4, z8, mult, lvl, zw);
+#else
+            mach1_d4_tile_z(tr + (a*Nb + b)*words, K4, z8, zw);
+#endif
+            const int8_t * z = (const int8_t *) zw;
+            for (int i = 0; i < 256; ++i) {
+                zf[i] = (float) z[i];
+            }
+            const int64_t wv = (a + b <= Nb - 1) ? Mb + Nb - 1 - (a + b) : Mb + Nb - 2 - (a + b);
+            const float sc = un*gwe[wv];
+            for (int64_t k = 0; k < cnt; ++k) {
+                const float * u = ubuf + (p0 + k)*n + b*16;
+                for (int c = 0; c < 16; ++c) {
+                    us[c] = sc*u[c];
+                }
+                float * ak = acc + k*256;
+                for (int r = 0; r < 16; ++r) {
+                    for (int c = 0; c < 16; ++c) {
+                        ak[r*16 + c] += zf[r*16 + c]*us[c];
+                    }
+                }
+            }
+        }
+        for (int64_t k = 0; k < cnt; ++k) {
+            float * v = vbuf + (p0 + k)*m + a*16;
+            const float * ak = acc + k*256;
+            for (int r = 0; r < 16; ++r) {
+                float s = 0.0f;
+                for (int c = 0; c < 16; ++c) {
+                    s += ak[r*16 + c];
+                }
+                v[r] = s;
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    for (int64_t p = ith; p < n_pairs; p += nth) {
+        const int64_t sI = pairs[3*p + 0];
+        const int64_t tI = pairs[3*p + 1];
+        const int64_t e  = pairs[3*p + 2];
+        float * v = vbuf + p*m;
+        mach1_hadamard_f32(v, m);
+        float * y = yd + (tI*n_used + sI)*m;
+        for (int64_t i = 0; i < m; ++i) {
+            y[i] = GGML_CPU_FP16_TO_FP32(svd[e*m + i])*v[i];
         }
     }
 }
