@@ -3055,21 +3055,21 @@ static __device__ __forceinline__ mach1_tc_frag_bi8 mach1_rt_spine_direct_b_i8(
         const unsigned p1 = s1*(s1 + 1u);
         b.r = (uint32_t) s_ztab[(p0 >> 6) & 1023u] |
               ((uint32_t) s_ztab[(p1 >> 6) & 1023u] << 16);
-        return b;
-    }
+    } else {
 #pragma unroll
-    for (int h = 0; h < 2; ++h) {
-        const int s    = ri*8 + ti*2 + h;
-        const int j0   = s*8;
-        const int wa   = j0 >> 4;
-        const int off  = j0 & 15;
-        const int wb_i = wa + 1 == 64 ? 0 : wa + 1;
-        const unsigned aw = cd[wa];
-        const unsigned bw = cd[wb_i];
-        const unsigned state = (((aw << 16) | bw) >> (16 - off)) & 0xFFFFu;
-        const unsigned p = state*(state + 1u);
-        // ztab's upper half resolves the codec's first-value sign flip.
-        b.r |= (uint32_t) s_ztab[(p >> 6) & 1023u] << (16*h);
+        for (int h = 0; h < 2; ++h) {
+            const int s    = ri*8 + ti*2 + h;
+            const int j0   = s*8;
+            const int wa   = j0 >> 4;
+            const int off  = j0 & 15;
+            const int wb_i = wa + 1 == 64 ? 0 : wa + 1;
+            const unsigned aw = cd[wa];
+            const unsigned bw = cd[wb_i];
+            const unsigned state = (((aw << 16) | bw) >> (16 - off)) & 0xFFFFu;
+            const unsigned p = state*(state + 1u);
+            // ztab's upper half resolves the codec's first-value sign flip.
+            b.r |= (uint32_t) s_ztab[(p >> 6) & 1023u] << (16*h);
+        }
     }
     return b;
 }
@@ -4465,25 +4465,25 @@ static __device__ __forceinline__ void mach1_rt_walk_rows_v_body(
             *counter = 0;   // self-reset for the next op on this stream
         }
         __threadfence();
-        if (TCF) {
+        if constexpr (TCF) {
             mach1_tc_fwht_dyn<WG, true>(m, scr_v, nullptr, dst, sv, operm,
                                         htab, (half *) obuf, tid);
-            return;
-        }
-        for (int i = tid; i < m; i += WG) {
-            obuf[i] = __ldcg(&scr_v[i]);
-        }
-        __syncthreads();
-        mach1_fwht_block(obuf, m, tid, WG);
-        const float osc = __fsqrt_rn((float) m);
-        if (operm == nullptr) {
-            for (int i = tid; i < m; i += WG) {
-                dst[i] = __fdiv_rn(obuf[i], osc) * sv[i];
-            }
         } else {
-            // vtiled fold: identical values stored at the permuted row
             for (int i = tid; i < m; i += WG) {
-                dst[operm[i]] = __fdiv_rn(obuf[i], osc) * sv[i];
+                obuf[i] = __ldcg(&scr_v[i]);
+            }
+            __syncthreads();
+            mach1_fwht_block(obuf, m, tid, WG);
+            const float osc = __fsqrt_rn((float) m);
+            if (operm == nullptr) {
+                for (int i = tid; i < m; i += WG) {
+                    dst[i] = __fdiv_rn(obuf[i], osc) * sv[i];
+                }
+            } else {
+                // vtiled fold: identical values stored at the permuted row
+                for (int i = tid; i < m; i += WG) {
+                    dst[operm[i]] = __fdiv_rn(obuf[i], osc) * sv[i];
+                }
             }
         }
     } else {
@@ -14931,25 +14931,25 @@ __global__ void __launch_bounds__(WG, MINB) mach1_rt_qkv_batch_kernel(
         }
         return;
     }
-    if (TCF) {
+    if constexpr (TCF) {
         mach1_tc_fwht_dyn<WG, true>(op.m, op.scr_v, nullptr, op.dst, op.sv, op.perm,
                                     htab, (half *) obuf, tid);
-        return;
-    }
-    for (int i = tid; i < op.m; i += WG) {
-        obuf[i] = __ldcg(&op.scr_v[i]);
-    }
-    __syncthreads();
-    mach1_fwht_block(obuf, op.m, tid, WG);
-    const float osc = __fsqrt_rn((float) op.m);
-    if (op.perm == nullptr) {
-        for (int i = tid; i < op.m; i += WG) {
-            op.dst[i] = __fdiv_rn(obuf[i], osc) * op.sv[i];
-        }
     } else {
-        // vtiled fold: identical values stored at the permuted row
         for (int i = tid; i < op.m; i += WG) {
-            op.dst[op.perm[i]] = __fdiv_rn(obuf[i], osc) * op.sv[i];
+            obuf[i] = __ldcg(&op.scr_v[i]);
+        }
+        __syncthreads();
+        mach1_fwht_block(obuf, op.m, tid, WG);
+        const float osc = __fsqrt_rn((float) op.m);
+        if (op.perm == nullptr) {
+            for (int i = tid; i < op.m; i += WG) {
+                op.dst[i] = __fdiv_rn(obuf[i], osc) * op.sv[i];
+            }
+        } else {
+            // vtiled fold: identical values stored at the permuted row
+            for (int i = tid; i < op.m; i += WG) {
+                op.dst[op.perm[i]] = __fdiv_rn(obuf[i], osc) * op.sv[i];
+            }
         }
     }
 }
@@ -15165,11 +15165,11 @@ static void mach1_rt_walk_tt_launch(cudaStream_t stream,
         static bool carve_d[GGML_CUDA_MAX_DEVICES] = {false}; \
         bool & carve = carve_d[ggml_cuda_get_device()]; \
         if (!carve) { carve = true; \
-            cudaFuncSetAttribute((const void *) mach1_rt_walk_tt_pair_kernel<WGT, TTV, ZD, 2>, \
+            cudaFuncSetAttribute((const void *) mach1_rt_walk_tt_pair_kernel<WGT, TTV, ZD, (WGT == 512 ? 2 : 1)>, \
                 cudaFuncAttributePreferredSharedMemoryCarveout, 100); \
             cudaGetLastError(); \
         } \
-        mach1_launch(mach1_rt_walk_tt_pair_kernel<WGT, TTV, ZD, 2>, tp, \
+        mach1_launch(mach1_rt_walk_tt_pair_kernel<WGT, TTV, ZD, (WGT == 512 ? 2 : 1)>, tp, \
             ops[0], ops[1], ops[2], tlut, n, nt, \
             ZD ? zt.ztab : (const uint16_t *) nullptr, ZD ? zt.zstep : 0.0f); \
     } else { \
@@ -18574,24 +18574,6 @@ __global__ void mach1_da_redout_kernel(
     for (int i = tid; i < mb; i += WG) {
         y[i] = __fmul_rn(da_sh[i], __half2float(sv[(int64_t) e*mb + i]));
     }
-}
-
-static __global__ void mach1_da_walk_reduce_kernel(
-        const float * __restrict__ scr_p,
-        float       * __restrict__ scr_v,
-        const int Mb, const int nchunks, const int64_t total) {
-    const int64_t gid = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (gid >= total) {
-        return;
-    }
-    const int64_t et = gid/((int64_t) Mb*16);
-    const int64_t ri = gid % ((int64_t) Mb*16);
-    const float * p = scr_p + ((int64_t) et*Mb + ri/16)*nchunks*16 + (ri & 15);
-    float s = 0.0f;
-    for (int c = 0; c < nchunks; ++c) {
-        s += p[(int64_t) c*16];
-    }
-    scr_v[gid] = s;
 }
 
 template <int WG>

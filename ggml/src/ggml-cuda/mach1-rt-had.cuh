@@ -98,20 +98,19 @@ static __device__ void mach1_hadr_block(float * sh, const int d, const int r, co
         __syncthreads();
     }
     const float sc = __fsqrt_rn((float) d);
-    if (PAR) {
+    if constexpr (PAR) {
         if (r == 12) {
             mach1_hadr_radix_par<12, TR, WG>(sh, d, M, tid, sc);
         } else {
             mach1_hadr_radix_par<20, TR, WG>(sh, d, M, tid, sc);
         }
-        __syncthreads();
-        return;
-    }
-    for (int b = tid; b < M; b += WG) {
-        if (r == 12) {
-            mach1_hadr_radix_col<12, TR>(sh, M, b, sc);
-        } else {
-            mach1_hadr_radix_col<20, TR>(sh, M, b, sc);
+    } else {
+        for (int b = tid; b < M; b += WG) {
+            if (r == 12) {
+                mach1_hadr_radix_col<12, TR>(sh, M, b, sc);
+            } else {
+                mach1_hadr_radix_col<20, TR>(sh, M, b, sc);
+            }
         }
     }
     __syncthreads();
